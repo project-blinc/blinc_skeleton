@@ -40,11 +40,112 @@
 
 use blinc_core::draw::{Skeleton, SkinningData};
 use blinc_core::Mat4;
-use blinc_gltf::{AnimatedProperty, AnimationSampler, GltfAnimation, GltfSkeleton};
+use blinc_gltf::{
+    AnimatedProperty, AnimationSampler, GltfAnimation, GltfScene, GltfSkeleton, NodeTransform,
+};
 
 mod sample;
 
 pub use sample::{normalize4, quat_slerp, Sampled};
+
+/// Sample an animation channel's sampler at time `t`, returning the
+/// interpolated value. Returns `None` when the sampler has zero
+/// keyframes.
+///
+/// Exposed so callers can write their own pose / node-transform
+/// machinery without depending on blinc_skeleton's `Pose` struct.
+pub fn sample_channel(
+    sampler: &blinc_gltf::AnimationSampler,
+    t: f32,
+) -> Option<Sampled> {
+    sample::sample(sampler, t)
+}
+
+/// Evaluate `clip` at scene time `t` and write the sampled values
+/// directly into `scene.nodes[*].transform`.
+///
+/// This is the **transform-animation** path, for clips that drive
+/// scene-graph node TRS channels directly (vehicles lifting off,
+/// mechanical parts rotating, cameras moving). For **skinned**
+/// animation — clips that target joint nodes inside a skin — use
+/// [`Pose::evaluate`] instead, which looks channels up through the
+/// skin's joint list and writes into per-joint `JointTransform`s.
+///
+/// Channels targeting nodes that don't exist in `scene.nodes` are
+/// silently skipped. Nodes stored in [`NodeTransform::Matrix`] form
+/// are also skipped (they can't be updated component-wise without a
+/// polar decomposition) — real exporters emit TRS for any node with
+/// animation channels, so this is only a defensive carve-out.
+pub fn animate_scene_nodes(scene: &mut GltfScene, clip: &GltfAnimation, t: f32) {
+    animate_scene_nodes_with(scene, clip, |_| t);
+}
+
+/// Same as [`animate_scene_nodes`] but picks the sampling time
+/// per-channel. `time_at_node(node_index)` decides at what clip time
+/// each channel's target node is sampled.
+///
+/// Motivation: mechanical assets often compose a scene-speed "body"
+/// animation (hover, liftoff, bob) with one or more parts that should
+/// spin at a visibly different rate (rotors, turbines, fans). Feeding
+/// all channels the same `t` makes either the body look wrong or the
+/// rotors look wrong. This lets callers apply a per-node time
+/// multiplier — e.g. `t * 3.0` for rotor nodes, `t` for everything
+/// else — without having to split the clip into multiple passes.
+///
+/// Typical use:
+///
+/// ```ignore
+/// let fast_nodes: std::collections::HashSet<usize> =
+///     scene.nodes.iter().enumerate()
+///         .filter(|(_, n)| n.name.as_deref().map_or(false, |s| s.contains("Rotor")))
+///         .map(|(i, _)| i)
+///         .collect();
+/// animate_scene_nodes_with(&mut scene, clip, |node_idx| {
+///     if fast_nodes.contains(&node_idx) { t * 3.0 } else { t }
+/// });
+/// ```
+pub fn animate_scene_nodes_with<F: Fn(usize) -> f32>(
+    scene: &mut GltfScene,
+    clip: &GltfAnimation,
+    time_at_node: F,
+) {
+    for ch in &clip.channels {
+        let Some(node) = scene.nodes.get_mut(ch.target.node) else {
+            continue;
+        };
+        let t = time_at_node(ch.target.node);
+        let Some(sampled) = sample::sample(&ch.sampler, t) else {
+            continue;
+        };
+
+        let (mut translation, mut rotation, mut scale) = match node.transform {
+            NodeTransform::Trs {
+                translation,
+                rotation,
+                scale,
+            } => (translation, rotation, scale),
+            NodeTransform::Matrix(_) => continue,
+        };
+
+        match (ch.target.property, sampled) {
+            (AnimatedProperty::Translation, Sampled::Vec3(v)) => translation = v,
+            (AnimatedProperty::Rotation, Sampled::Vec4(q)) => {
+                rotation = normalize4(q);
+            }
+            (AnimatedProperty::Scale, Sampled::Vec3(v)) => scale = v,
+            // MorphWeights target meshes, not nodes — unaffected by
+            // this helper. They're reserved for a future
+            // `animate_scene_morph_weights`.
+            _ => continue,
+        }
+
+        node.transform = NodeTransform::Trs {
+            translation,
+            rotation,
+            scale,
+        };
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-joint transform
