@@ -89,6 +89,40 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
     }
     debug_assert_eq!(times.len(), values.len());
 
+    // ── Sign-align consecutive quaternions ────────────────────────────
+    //
+    // FBX → glTF exporters frequently write quaternion keyframes whose
+    // signs are chosen independently per-keyframe, losing the
+    // continuous-sign convention authored in the source. A pair that
+    // physically represents a 1° rotation can end up as `(q, -q')`
+    // where `q'` is `q` perturbed by 1° — their raw quaternion delta
+    // reads as 358° around an effectively-random axis (the small
+    // residual numerator divided by a small denominator amplifies
+    // noise).
+    //
+    // Without this pass, the axis-angle densifier below would subdivide
+    // those 358° arcs into half a dozen intermediate keys pointing at
+    // garbage directions, teleporting the affected node subtree into
+    // impossible poses mid-animation.
+    //
+    // Trade-off: after alignment, any arc stays within `[0, π]`, so a
+    // genuine long-way authored rotation (rotor spinning > 180° between
+    // keys) is collapsed to its shortest-arc interpretation. That
+    // matches what the runtime slerp would have produced without
+    // densification — so the pass becomes a no-op for well-behaved
+    // rotor channels rather than a fix, but avoids catastrophic
+    // distortion on the much-more-common sign-inconsistent inputs.
+    // Recovering true long-way rotation needs multi-point velocity
+    // inference (see BACKLOG).
+    for i in 1..values.len() {
+        let prev = values[i - 1];
+        let q = values[i];
+        let dot = prev[0] * q[0] + prev[1] * q[1] + prev[2] * q[2] + prev[3] * q[3];
+        if dot < 0.0 {
+            values[i] = [-q[0], -q[1], -q[2], -q[3]];
+        }
+    }
+
     let mut new_times = Vec::with_capacity(times.len() * 2);
     let mut new_values = Vec::with_capacity(values.len() * 2);
     new_times.push(times[0]);
@@ -135,7 +169,30 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
             new_values.push(q1);
             continue;
         }
-        let axis = [delta[0] / s, delta[1] / s, delta[2] / s];
+        // Normalize the axis. When the input quaternions drift from
+        // unit length (exporter rounding / cubic-interp residue /
+        // lossy conversion), delta.xyz divided by `s = sin(angle/2)`
+        // can end up slightly off-unit, and the reconstructed
+        // `quat_from_axis_angle` output drifts from the unit sphere
+        // too — which the runtime slerp then amplifies over
+        // consecutive sub-segments, producing visible wobble on the
+        // densified path.
+        let axis_raw = [delta[0] / s, delta[1] / s, delta[2] / s];
+        let axis_len = (axis_raw[0] * axis_raw[0]
+            + axis_raw[1] * axis_raw[1]
+            + axis_raw[2] * axis_raw[2])
+            .sqrt();
+        let axis = if axis_len > 1e-6 {
+            [
+                axis_raw[0] / axis_len,
+                axis_raw[1] / axis_len,
+                axis_raw[2] / axis_len,
+            ]
+        } else {
+            new_times.push(t1);
+            new_values.push(q1);
+            continue;
+        };
 
         // Number of sub-segments needed so each is ≤ MAX_SEG_RAD.
         // Always ≥ 2 because we entered this branch with angle > MAX_SEG_RAD.
@@ -145,11 +202,14 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
         // is computed by composing q0 with a partial rotation of the
         // delta — `(axis, angle * u)` — so the runtime's slerp
         // between adjacent inserted keys reproduces the authored
-        // axis-angle motion exactly.
+        // axis-angle motion exactly. Results are renormalized because
+        // q0 may have drifted from unit length (rare, but cheap to
+        // guard against) and we don't want the error to accumulate
+        // across the sub-segments the runtime will slerp between.
         for k in 1..n_subs {
             let u = k as f32 / n_subs as f32;
             let sub_delta = quat_from_axis_angle(axis, angle * u);
-            let q_mid = quat_mul(sub_delta, q0);
+            let q_mid = quat_normalize(quat_mul(sub_delta, q0));
             new_times.push(t0 + dt * u);
             new_values.push(q_mid);
         }
@@ -200,6 +260,20 @@ fn quat_from_axis_angle(axis: [f32; 3], angle: f32) -> [f32; 4] {
     [axis[0] * s, axis[1] * s, axis[2] * s, half.cos()]
 }
 
+/// Renormalize a quaternion to unit length. `blinc_skeleton::sample`
+/// expects unit-length inputs for the slerp fast path; a quaternion
+/// that is 0.999× unit-length won't crash anything but will bias the
+/// sampled rotation angle, which compounds over multiple sub-segment
+/// slerps into visible per-frame wobble on densified channels.
+fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len > 1e-8 {
+        [q[0] / len, q[1] / len, q[2] / len, q[3] / len]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -237,9 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn densify_subdivides_a_270_degree_segment() {
-        // Two keys with 270° (= 4.71 rad) between them. Should split
-        // into ceil(4.71 / (π/3)) = 5 sub-segments → 4 inserted keys.
+    fn densify_subdivides_a_large_short_arc() {
+        // 270° authored as a single quaternion delta. After the
+        // sign-alignment pre-pass, this collapses to its 90°
+        // shortest-arc representation (the authored long-way intent
+        // is lost — see module docs). 90° > MAX_SEG_RAD = 60°, so
+        // one intermediate key is inserted at 45°.
         let q0 = [0.0, 0.0, 0.0, 1.0];
         let half = (270.0_f32.to_radians()) * 0.5;
         let q1 = [0.0, half.sin(), 0.0, half.cos()];
@@ -247,58 +324,53 @@ mod tests {
         let mut values = vec![q0, q1];
 
         let inserted = densify_one_channel(&mut times, &mut values);
-        assert_eq!(inserted, 4);
-        assert_eq!(times.len(), 6);
+        // 90° / 60° → ceil = 2 sub-segments → 1 inserted key.
+        assert_eq!(inserted, 1);
+        assert_eq!(times.len(), 3);
+        assert!((times[1] - 0.5).abs() < 1e-5);
 
-        // Inserted timestamps should be evenly spaced.
-        for (i, t) in times.iter().enumerate() {
-            let expected = i as f32 / 5.0;
-            assert!((t - expected).abs() < 1e-5, "time[{i}] = {t}, expected {expected}");
-        }
-
-        // Each consecutive pair must now have an unambiguous slerp arc
-        // (angle < 60°).
+        // Every consecutive pair is now < 60°.
         for w in values.windows(2) {
             let d = delta_quat(w[0], w[1]);
             let angle = 2.0 * d[3].clamp(-1.0, 1.0).acos();
-            assert!(angle <= MAX_SEG_RAD + 1e-4, "post-densify segment angle = {angle} > MAX_SEG_RAD");
+            assert!(angle <= MAX_SEG_RAD + 1e-4);
         }
     }
 
     #[test]
-    fn densify_handles_negative_w_authored_long_way() {
-        // 200° rotation. Quaternion has negative w. Slerp without
-        // densification would interpret this as -160° (shortest arc).
-        // Densified, it should be a sequence of small forward steps
-        // covering the full 200°.
-        let q0 = [0.0, 0.0, 0.0, 1.0];
-        let half = (200.0_f32.to_radians()) * 0.5;
-        let q1 = [0.0, half.sin(), 0.0, half.cos()];
-        assert!(q1[3] < 0.0, "test setup: q1.w should be negative for >180° rotation");
-
+    fn sign_inconsistent_quaternions_are_aligned_not_blown_up() {
+        // This is the buster_drone failure mode: two keyframes that
+        // represent the same physical rotation (or near it), but the
+        // exporter sign-flipped one of them. Raw delta extraction
+        // reads this as ~358° around a noise-amplified axis and,
+        // without sign alignment, the densifier would insert garbage
+        // intermediate keys that teleport the affected node around.
+        //
+        // After the pre-pass, consecutive quaternions are sign-aligned
+        // so the delta.w is always >= 0 and the measured angle is the
+        // shortest arc between them. For a near-identity physical
+        // rotation, that means no densification fires at all.
+        let q0 = [0.5779998, -0.4667882, -0.5311385, -0.40732908];
+        // `q1` has the same physical orientation as q0 up to a small
+        // perturbation around X, but the whole quaternion sign was
+        // flipped during export. dot(q0, q1_raw) ≈ -1.
+        let q1_raw = [-0.5788, 0.4672, 0.5311, 0.4063];
         let mut times = vec![0.0, 1.0];
-        let mut values = vec![q0, q1];
+        let mut values = vec![q0, q1_raw];
 
         let inserted = densify_one_channel(&mut times, &mut values);
-        assert!(inserted >= 3, "200° should split into at least 4 sub-segments");
-
-        // Walk the densified keys and verify the cumulative axis-angle
-        // matches +200° around +Y, not -160°.
-        let mut total = 0.0_f32;
-        for w in values.windows(2) {
-            let d = delta_quat(w[0], w[1]);
-            let angle = 2.0 * d[3].clamp(-1.0, 1.0).acos();
-            // After densification each delta should be a forward
-            // rotation around +Y. Verify by checking the y component
-            // sign matches the rotation direction.
-            assert!(d[1] >= -1e-4, "densified deltas must rotate around +Y, got d.y = {}", d[1]);
-            total += angle;
-        }
-        let expected = 200.0_f32.to_radians();
-        assert!(
-            (total - expected).abs() < 0.05,
-            "cumulative densified angle = {total} rad, expected {expected} rad"
+        // The inserted count here must be 0 — a small physical
+        // rotation should never subdivide.
+        assert_eq!(
+            inserted, 0,
+            "sign-inconsistent near-identity pair incorrectly densified \
+             (would teleport the node at runtime)"
         );
+
+        // And the aligned q1 should now have dot(q0, q1) >= 0.
+        let q1 = values[1];
+        let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+        assert!(dot >= 0.0);
     }
 
     #[test]
@@ -331,20 +403,46 @@ mod tests {
     }
 
     #[test]
-    fn densify_preserves_short_arcs_alongside_long_ones() {
-        // Mix of small (10°) and large (200°) segments in one channel.
-        // Only the large segment should be subdivided.
+    fn densified_keyframes_are_unit_length() {
+        // Input quaternions slightly off-unit (simulating exporter
+        // drift) should still produce unit-length densified keys.
+        let q0 = [0.0, 0.0, 0.0, 1.001]; // 0.1% over-unit
+        let half = (270.0_f32.to_radians()) * 0.5;
+        let q1 = [0.0, half.sin() * 1.002, 0.0, half.cos() * 1.002];
+
+        let mut times = vec![0.0, 1.0];
+        let mut values = vec![q0, q1];
+        let _ = densify_one_channel(&mut times, &mut values);
+
+        // Skip the two original endpoints (we don't renormalize those —
+        // sampler should handle slight drift without trouble) and check
+        // only the *inserted* ones.
+        for v in &values[1..values.len() - 1] {
+            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
+            assert!(
+                (len - 1.0).abs() < 1e-4,
+                "inserted key {v:?} has length {len}, expected unit"
+            );
+        }
+    }
+
+    #[test]
+    fn densify_preserves_short_arcs_alongside_mid_arcs() {
+        // Mix of a small (10°) and a medium (160°) segment. After
+        // sign alignment the medium segment's delta is still 160°
+        // — above MAX_SEG_RAD but below the sign-flip threshold —
+        // so it subdivides. The small segment doesn't.
         let q0 = [0.0, 0.0, 0.0, 1.0];
         let h_small = (10.0_f32.to_radians()) * 0.5;
         let q1 = [0.0, h_small.sin(), 0.0, h_small.cos()];
-        let h_big = h_small + (200.0_f32.to_radians()) * 0.5;
+        let h_big = h_small + (160.0_f32.to_radians()) * 0.5;
         let q2 = [0.0, h_big.sin(), 0.0, h_big.cos()];
 
         let mut times = vec![0.0, 0.1, 0.2];
         let mut values = vec![q0, q1, q2];
         let pre_len = times.len();
         let inserted = densify_one_channel(&mut times, &mut values);
-        assert!(inserted >= 3);
+        assert!(inserted >= 2, "160° segment should subdivide");
         assert_eq!(times.len(), pre_len + inserted);
 
         // First original segment (q0 → q1) is small — shouldn't gain
