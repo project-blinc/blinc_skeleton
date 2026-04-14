@@ -1,0 +1,17 @@
+[package]
+name = "blinc_skeleton"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Runtime poser for Blinc — evaluates glTF animations, composes joint hierarchies, produces GPU-ready skinning matrices"
+repository = "https://github.com/project-blinc/blinc_skeleton"
+readme = "README.md"
+rust-version = "1.75"
+keywords = ["animation", "skeleton", "skinning", "gltf", "blinc"]
+categories = ["graphics", "game-development"]
+
+# Standalone package — not a member of the Blinc workspace.
+
+[dependencies]
+blinc_core = { path = "../../crates/blinc_core" }
+blinc_gltf = { path = "../blinc_gltf" }
