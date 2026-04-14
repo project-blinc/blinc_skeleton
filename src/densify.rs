@@ -105,15 +105,6 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
     // garbage directions, teleporting the affected node subtree into
     // impossible poses mid-animation.
     //
-    // Trade-off: after alignment, any arc stays within `[0, π]`, so a
-    // genuine long-way authored rotation (rotor spinning > 180° between
-    // keys) is collapsed to its shortest-arc interpretation. That
-    // matches what the runtime slerp would have produced without
-    // densification — so the pass becomes a no-op for well-behaved
-    // rotor channels rather than a fix, but avoids catastrophic
-    // distortion on the much-more-common sign-inconsistent inputs.
-    // Recovering true long-way rotation needs multi-point velocity
-    // inference (see BACKLOG).
     for i in 1..values.len() {
         let prev = values[i - 1];
         let q = values[i];
@@ -123,89 +114,112 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
         }
     }
 
+    // ── Precompute per-segment axis + angle (shortest-arc) ────────────
+    //
+    // After sign-alignment every segment's measured arc is in `[0, π]`,
+    // which is what runtime slerp would pick. That's safe but loses
+    // authored long-way rotations on fast rotors — the exact buster_
+    // drone blade problem. We fix it in the next step by looking at
+    // each segment's neighbors and re-interpreting arcs that buck the
+    // neighbor trend.
+    let n_segs = times.len() - 1;
+    let mut axes: Vec<[f32; 3]> = Vec::with_capacity(n_segs);
+    let mut angles: Vec<f32> = Vec::with_capacity(n_segs);
+    for i in 0..n_segs {
+        let q0 = values[i];
+        let q1 = values[i + 1];
+        let delta = delta_quat(q0, q1);
+        let w = delta[3].clamp(-1.0, 1.0);
+        let angle = 2.0 * w.acos();
+        let s = (1.0 - w * w).sqrt();
+        let axis = if s > 1e-4 {
+            let raw = [delta[0] / s, delta[1] / s, delta[2] / s];
+            let len = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+            if len > 1e-6 {
+                [raw[0] / len, raw[1] / len, raw[2] / len]
+            } else {
+                [1.0, 0.0, 0.0]
+            }
+        } else {
+            // Near-identity or full-revolution — axis undefined. Set
+            // to an arbitrary unit vector; the `angle < threshold`
+            // guard below will skip subdivision for this segment.
+            [1.0, 0.0, 0.0]
+        };
+        axes.push(axis);
+        angles.push(angle);
+    }
+
+    // ── Multi-point long-way inference ────────────────────────────────
+    //
+    // A segment whose axis points opposite to both of its neighbors'
+    // (while the neighbors agree) almost certainly encoded a > 180°
+    // rotation that sign-alignment collapsed to its shortest-arc
+    // representation. Restore the authored direction by flipping the
+    // axis and replacing the angle with `2π - angle` — same quaternion
+    // endpoints, forward path instead of backward.
+    //
+    // Bounds: only middle segments get checked; endpoints have no
+    // second neighbor to confirm the pattern, and flipping a single
+    // segment with no corroboration is more likely to fabricate
+    // rotation than recover it. Threshold on `angle > 30°` ensures we
+    // don't flip tiny rotations where the axis is numerically
+    // ambiguous.
+    if n_segs >= 3 {
+        let min_flip_angle: f32 = 30.0_f32.to_radians();
+        let threshold_neighbors_agree: f32 = 0.9;
+        let threshold_opposed: f32 = -0.5;
+        for i in 1..n_segs - 1 {
+            if angles[i] < min_flip_angle {
+                continue;
+            }
+            let prev_axis = axes[i - 1];
+            let next_axis = axes[i + 1];
+            let curr_axis = axes[i];
+            let na = dot3(prev_axis, next_axis);
+            let cp = dot3(curr_axis, prev_axis);
+            let cn = dot3(curr_axis, next_axis);
+            if na > threshold_neighbors_agree
+                && cp < threshold_opposed
+                && cn < threshold_opposed
+            {
+                axes[i] = [-curr_axis[0], -curr_axis[1], -curr_axis[2]];
+                angles[i] = std::f32::consts::TAU - angles[i];
+            }
+        }
+    }
+
+    // ── Emit densified keyframe list ─────────────────────────────────
     let mut new_times = Vec::with_capacity(times.len() * 2);
     let mut new_values = Vec::with_capacity(values.len() * 2);
     new_times.push(times[0]);
     new_values.push(values[0]);
 
-    for i in 1..times.len() {
-        let q0 = values[i - 1];
-        let q1 = values[i];
-        let t0 = times[i - 1];
-        let t1 = times[i];
+    for i in 0..n_segs {
+        let q0 = values[i];
+        let q1 = values[i + 1];
+        let t0 = times[i];
+        let t1 = times[i + 1];
         let dt = t1 - t0;
-
-        // Compute the delta rotation that takes us from q0 to q1, in
-        // the *authored* sign — no shortest-arc rewrite.
-        //
-        //   delta = q1 * conj(q0)
-        //
-        // delta.w encodes the FULL arc: w = cos(angle/2) ranges over
-        // [-1, 1] as angle ranges over [0, 2π]. A negative w means
-        // the authored arc is in (π, 2π) — the long-way case that
-        // standard slerp gets wrong.
-        let delta = delta_quat(q0, q1);
-        let w = delta[3].clamp(-1.0, 1.0);
-        let angle = 2.0 * w.acos();
+        let axis = axes[i];
+        let angle = angles[i];
 
         if angle <= MAX_SEG_RAD {
-            // Slerp between q0 and q1 is unambiguous (angle < 60°
-            // means dot(q0, q1) ≥ 0.866 — far from the sign flip).
             new_times.push(t1);
             new_values.push(q1);
             continue;
         }
-
-        // Extract the rotation axis. When sin(angle/2) ≈ 0 the axis
-        // is undefined — that happens at angle = 0 (handled by the
-        // early-return above) or angle = 2π (full revolution authored
-        // as q1 = ±q0). The 2π case is genuinely ambiguous: we can't
-        // tell "rotated full circle" from "did nothing". Skip
-        // densification for it; the runtime will see zero rotation
-        // either way, which is what slerp would produce anyhow.
-        let s = (1.0 - w * w).sqrt();
-        if s < 1e-4 {
-            new_times.push(t1);
-            new_values.push(q1);
-            continue;
-        }
-        // Normalize the axis. When the input quaternions drift from
-        // unit length (exporter rounding / cubic-interp residue /
-        // lossy conversion), delta.xyz divided by `s = sin(angle/2)`
-        // can end up slightly off-unit, and the reconstructed
-        // `quat_from_axis_angle` output drifts from the unit sphere
-        // too — which the runtime slerp then amplifies over
-        // consecutive sub-segments, producing visible wobble on the
-        // densified path.
-        let axis_raw = [delta[0] / s, delta[1] / s, delta[2] / s];
-        let axis_len = (axis_raw[0] * axis_raw[0]
-            + axis_raw[1] * axis_raw[1]
-            + axis_raw[2] * axis_raw[2])
-            .sqrt();
-        let axis = if axis_len > 1e-6 {
-            [
-                axis_raw[0] / axis_len,
-                axis_raw[1] / axis_len,
-                axis_raw[2] / axis_len,
-            ]
-        } else {
-            new_times.push(t1);
-            new_values.push(q1);
-            continue;
-        };
 
         // Number of sub-segments needed so each is ≤ MAX_SEG_RAD.
         // Always ≥ 2 because we entered this branch with angle > MAX_SEG_RAD.
         let n_subs = (angle / MAX_SEG_RAD).ceil() as usize;
 
-        // Insert (n_subs - 1) intermediate keyframes. Each keyframe
-        // is computed by composing q0 with a partial rotation of the
-        // delta — `(axis, angle * u)` — so the runtime's slerp
-        // between adjacent inserted keys reproduces the authored
-        // axis-angle motion exactly. Results are renormalized because
-        // q0 may have drifted from unit length (rare, but cheap to
-        // guard against) and we don't want the error to accumulate
-        // across the sub-segments the runtime will slerp between.
+        // Insert (n_subs - 1) intermediate keyframes along the chosen
+        // (possibly flipped) axis/angle. Runtime slerp between each
+        // adjacent pair covers ≤ MAX_SEG_RAD and is guaranteed
+        // unambiguous. Results are renormalized defensively — exporter
+        // rounding in the input can propagate into the reconstructed
+        // quaternions if we don't.
         for k in 1..n_subs {
             let u = k as f32 / n_subs as f32;
             let sub_delta = quat_from_axis_angle(axis, angle * u);
@@ -222,6 +236,11 @@ pub fn densify_one_channel(times: &mut Vec<f32>, values: &mut Vec<[f32; 4]>) -> 
     *times = new_times;
     *values = new_values;
     inserted
+}
+
+/// 3-component dot product — inlined to keep the densifier self-contained.
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -371,6 +390,60 @@ mod tests {
         let q1 = values[1];
         let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
         assert!(dot >= 0.0);
+    }
+
+    #[test]
+    fn multi_point_inference_flips_axis_outlier_to_long_way() {
+        // The concrete jitter pattern on accelerating rotors: three
+        // segments whose authored rates straddle the 180°/frame
+        // threshold. The middle segment's authored arc is > 180°, so
+        // sign-alignment collapses it to the opposite-axis short arc.
+        // The outer segments' authored arcs are < 180°, so alignment
+        // leaves them on the same axis as authored. The neighbor
+        // check should spot the middle segment's axis disagreement
+        // and flip it back to the long-way interpretation.
+        //
+        // Authored: 0° → 90° (around +Y) → 290° (around +Y, via a
+        // 200° step) → 380° (around +Y, via a 90° step).
+        let angles_deg = [0.0_f32, 90.0, 290.0, 380.0];
+        let mut times = Vec::new();
+        let mut values = Vec::new();
+        for (i, deg) in angles_deg.iter().enumerate() {
+            let h = deg.to_radians() * 0.5;
+            times.push(i as f32);
+            values.push([0.0, h.sin(), 0.0, h.cos()]);
+        }
+        let inserted = densify_one_channel(&mut times, &mut values);
+        assert!(inserted > 0);
+
+        // The first and third segments were authored as short (< 180°)
+        // rotations around +Y; sign-alignment leaves them alone. The
+        // middle segment's delta, after sign-alignment, has axis -Y
+        // and angle 160° (shortest arc). The inference check sees
+        // both neighbors on +Y and flips the middle to +Y 200°, which
+        // is the authored direction.
+        //
+        // We verify by recomputing the shortest-arc delta between each
+        // densified pair and asserting it rotates forward around +Y.
+        // The raw delta can appear negative on pairs where the
+        // sign-align pre-pass left the two quaternions on opposite
+        // hemispheres — physically a forward rotation, but encoded as
+        // a long-way negative-w rotation. Normalize the endpoints'
+        // signs before reading the delta so the y-component reflects
+        // the short-arc (i.e. physical) direction.
+        for w in values.windows(2) {
+            let mut q0 = w[0];
+            let q1 = w[1];
+            let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+            if dot < 0.0 {
+                q0 = [-q0[0], -q0[1], -q0[2], -q0[3]];
+            }
+            let d = delta_quat(q0, q1);
+            assert!(
+                d[1] >= -1e-3,
+                "post-inference shortest-arc delta should rotate around +Y, got d = {d:?}",
+            );
+        }
     }
 
     #[test]
