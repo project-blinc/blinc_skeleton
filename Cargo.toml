@@ -13,5 +13,9 @@ categories = ["graphics", "game-development"]
 # Standalone package — not a member of the Blinc workspace.
 
 [dependencies]
-blinc_core = { path = "../../crates/blinc_core" }
-blinc_gltf = { path = "../blinc_gltf" }
+# Each Blinc dep declares both `path` (used during local dev) and `git`
+# (used when this crate is fetched from its upstream repo by a
+# downstream consumer). See `blinc_gltf/Cargo.toml` for the full
+# rationale. Bump in lockstep with the corresponding upstream commits.
+blinc_core = { path = "../../crates/blinc_core", git = "https://github.com/project-blinc/Blinc.git", rev = "4a7cef2acf9ba3d0c87dbf9be91c63e0a612f295" }
+blinc_gltf = { path = "../blinc_gltf", git = "https://github.com/project-blinc/blinc_gltf.git", rev = "8cd810f0a4ca4e687d1e94868a3da08835326b32" }
