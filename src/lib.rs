@@ -44,8 +44,10 @@ use blinc_gltf::{
     AnimatedProperty, AnimationSampler, GltfAnimation, GltfScene, GltfSkeleton, NodeTransform,
 };
 
+mod densify;
 mod sample;
 
+pub use densify::{densify_one_channel, densify_rotation_channels, MAX_SEG_RAD};
 pub use sample::{normalize4, quat_slerp, Sampled};
 
 /// Sample an animation channel's sampler at time `t`, returning the
