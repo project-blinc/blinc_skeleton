@@ -45,9 +45,11 @@ use blinc_gltf::{
 };
 
 mod densify;
+mod ik;
 mod sample;
 
 pub use densify::{densify_one_channel, densify_rotation_channels, MAX_SEG_RAD};
+pub use ik::{rotation_from_to, solve_two_bone, TwoBoneSolution};
 pub use sample::{normalize4, quat_slerp, Sampled};
 
 /// Sample an animation channel's sampler at time `t`, returning the

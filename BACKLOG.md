@@ -39,12 +39,19 @@ pipeline.
 
 ## Kinematics
 
-- [ ] **Two-bone IK**
-  - **Why:** Foot placement, hand-reaches-target constraints,
-    procedural head-look.
-  - **How:** Analytic solver — given root + middle + end joint plus
-    a target + pole, compute the two rotations that put the end at
-    the target. Write back into the pose before world composition.
+- [x] **Two-bone IK — position solver.** `solve_two_bone(root,
+  l_upper, l_lower, target, pole) -> TwoBoneSolution { middle, end,
+  reached }` in `ik.rs`. Law-of-cosines analytic, handles
+  over-extension (full-extend along target direction, `reached =
+  false`) and under-extension (clamp to minimum bone-length
+  difference). `rotation_from_to(from, to) -> quaternion` helper
+  exposed for callers converting position deltas to joint rotations.
+- [ ] **Two-bone IK — orientation-aware wrapper on `Pose`.** Follow-
+  up that takes `(skeleton, root_bone, middle_bone, end_bone,
+  target, pole)` and writes new local rotations into the pose,
+  handling the world ↔ local conversion via the joint hierarchy.
+  Depends on a per-pose world-rotation cache to avoid recomputing
+  the ancestor chain.
 
 - [ ] **FABRIK (Forward-And-Backward Reaching IK)**
   - **Why:** Multi-segment chains (spines, tentacles, tails).
