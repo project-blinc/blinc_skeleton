@@ -1162,9 +1162,22 @@ pub fn build_frame_draws(
     let weights_by_node = animate_scene_morph_weights(anim, t);
 
     // 4. Build a per-draw MeshData for every mesh-bearing node.
+    // Opaque/mask go first so their depth values populate the z-buffer
+    // before transparent fragments (which don't write depth) try to
+    // composite against them. Within each group we preserve scene-node
+    // iteration order — exporters typically author that order to be
+    // compositionally sensible (eye sclera before cornea, body before
+    // hair, etc.), and reordering by mesh-node camera distance flips
+    // collocated meshes in a way that reads as flicker on animated
+    // rigs. Callers that want a true per-draw back-to-front sort can
+    // do it post-hoc on the returned `Vec`.
+    //
+    // `camera_pos` is currently unused — kept in the signature so a
+    // future per-draw depth sort can drop in without breaking callers.
+    let _ = camera_pos;
     let world = scene.compute_world_transforms();
     let mut opaque: Vec<FrameDraw> = Vec::new();
-    let mut blend: Vec<(FrameDraw, f32)> = Vec::new(); // (draw, z from camera)
+    let mut blend: Vec<FrameDraw> = Vec::new();
 
     for (node_idx, node) in scene.nodes.iter().enumerate() {
         let Some(mesh_idx) = node.mesh else { continue };
@@ -1198,8 +1211,6 @@ pub fn build_frame_draws(
                 }
                 Arc::new(per_draw)
             } else {
-                // Still a fresh Arc, but the clone is a shallow
-                // MeshData copy with Arc<Vec> refcount bumps — cheap.
                 Arc::new(prim.clone())
             };
 
@@ -1209,25 +1220,14 @@ pub fn build_frame_draws(
                 transform: draw_xf,
             };
             if is_blend {
-                // Pivot for sorting — the mesh-node translation, which
-                // is close enough for coarse draw-order. Fine-grained
-                // per-triangle sort would be ideal but is O(n log n)
-                // in triangle count and needs a post-morph pass.
-                let tx = node_world.cols[3];
-                let dx = tx[0] - camera_pos[0];
-                let dy = tx[1] - camera_pos[1];
-                let dz = tx[2] - camera_pos[2];
-                let d2 = dx * dx + dy * dy + dz * dz;
-                blend.push((fd, d2));
+                blend.push(fd);
             } else {
                 opaque.push(fd);
             }
         }
     }
 
-    // Back-to-front: larger distance first.
-    blend.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    opaque.extend(blend.into_iter().map(|(fd, _)| fd));
+    opaque.extend(blend);
     opaque
 }
 
