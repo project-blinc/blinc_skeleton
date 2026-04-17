@@ -794,6 +794,51 @@ impl Pose {
     }
 }
 
+/// Build `SkinningData` by reading each joint's world transform
+/// straight from `scene.compute_world_transforms()`, then multiplying
+/// by the bone's inverse-bind matrix.
+///
+/// This is the preferred path for real glTF assets. [`Pose::skinning_data`]
+/// walks `Bone::parent`, which `blinc_gltf::skin::parse_skin` only sets
+/// when a joint's *direct* glTF parent is also a joint — rigs that
+/// thread non-joint glue nodes between joints (Armature wrappers,
+/// offset / pivot nodes, mesh root placeholders, etc.) lose those
+/// intermediate transforms and the character renders at origin,
+/// at wrong scale, or entirely off-camera.
+///
+/// Walking `compute_world_transforms` uses the full scene node graph
+/// so those glue transforms are folded in correctly.
+///
+/// Typical usage:
+///
+/// ```ignore
+/// animate_scene_nodes(&mut scene, &clip, t);
+/// // Optional: morph weights (or call Pose::evaluate for both).
+/// let morphs = animate_scene_morph_weights(&clip, t);
+/// let skinning = scene_skinning_data(&scene, skin);
+/// // Pass identity as the model matrix for skinned draws — skinning
+/// // matrices already produce world-space positions.
+/// ```
+pub fn scene_skinning_data(scene: &GltfScene, skin: &GltfSkeleton) -> SkinningData {
+    let world_per_node = scene.compute_world_transforms();
+    let matrices: Vec<[f32; 16]> = skin
+        .joint_nodes
+        .iter()
+        .zip(skin.skeleton.bones.iter())
+        .map(|(&node_idx, bone)| {
+            let w = world_per_node
+                .get(node_idx)
+                .copied()
+                .unwrap_or(Mat4::IDENTITY);
+            let ibm = mat4_from_array(bone.inverse_bind_matrix);
+            flatten_mat4(w.mul(&ibm))
+        })
+        .collect();
+    SkinningData {
+        joint_matrices: matrices,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Player
 // ─────────────────────────────────────────────────────────────────────────────
