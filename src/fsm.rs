@@ -6,6 +6,22 @@
 //! any condition fires, and evaluates a blended pose between the
 //! source and target for the duration of the fade.
 //!
+//! # Not to be confused with `blinc_core::fsm`
+//!
+//! Blinc ships a second state-machine implementation in
+//! [`blinc_core::fsm`] — used for widget interaction states (button
+//! hover/press, checkbox toggle, etc.). That machine is event-driven
+//! (`send(event_id)`), instantaneous (no transition duration), and
+//! uses user-supplied `FnMut()` callbacks for entry / exit / action
+//! hooks.
+//!
+//! This machine is **time-driven** (`tick(dt)`), conditions are
+//! **re-polled each tick** against named parameters rather than
+//! dispatched on discrete events, and transitions **blend over
+//! time** via the [`Pose::blend`](crate::Pose::blend) path. Reach
+//! for the core version on UI state; reach for this one on
+//! character animation.
+//!
 //! # Structure
 //!
 //! 1. Build a [`StateMachine`] with a list of [`ClipState`]s and an
