@@ -45,10 +45,12 @@ use blinc_gltf::{
 };
 
 mod densify;
+mod fsm;
 mod ik;
 mod sample;
 
 pub use densify::{densify_one_channel, densify_rotation_channels, MAX_SEG_RAD};
+pub use fsm::{ClipState, Condition, Parameters, StateIndex, StateMachine, Transition};
 pub use ik::{rotation_from_to, solve_fabrik, solve_two_bone, TwoBoneSolution};
 pub use sample::{normalize4, quat_slerp, Sampled};
 

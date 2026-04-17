@@ -74,12 +74,16 @@ pipeline.
 
 ## Higher-level state
 
-- [ ] **Animation state machine**
-  - **Why:** Game controllers want "idle → walk → run → attack" as a
-    graph, not manual clip juggling.
-  - **How:** Nodes are clips / blend trees; edges have transition
-    predicates (`finished`, `duration`, `condition(f32)`) and a
-    crossfade duration. Player becomes a `StateMachine` variant.
+- [x] **Animation state machine.** `StateMachine` in `fsm.rs` with
+  `ClipState` nodes (looping, speed-scalable, one-shot / held).
+  `Transition` edges carry a `Condition` predicate + crossfade
+  duration. Conditions: `Always`, `Bool`, `FloatGreaterThan`,
+  `FloatLessThan`, `StateFinished`, `StateDuration`, plus `All` /
+  `Any` combinators. Parameters held on the machine
+  (`set_bool` / `set_float`). Crossfades use `Pose::blend` internally
+  with a pre-allocated scratch pose. Blend-tree nodes (directional
+  locomotion fed by a stick axis) left as a `ClipState` enum
+  extension for a future PR.
 
 - [ ] **Event markers on animation clips**
   - **Why:** "Play footstep sound at frame 12 of the run cycle."
