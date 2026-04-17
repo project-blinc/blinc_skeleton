@@ -142,8 +142,8 @@ pub fn animate_scene_nodes_with<F: Fn(usize) -> f32>(
             }
             (AnimatedProperty::Scale, Sampled::Vec3(v)) => scale = v,
             // MorphWeights target meshes, not nodes — unaffected by
-            // this helper. They're reserved for a future
-            // `animate_scene_morph_weights`.
+            // this helper. Callers feed them to the renderer via
+            // [`animate_scene_morph_weights`].
             _ => continue,
         }
 
@@ -153,6 +153,48 @@ pub fn animate_scene_nodes_with<F: Fn(usize) -> f32>(
             scale,
         };
     }
+}
+
+/// Sample every `MorphWeights` channel in `clip` at time `t` and
+/// return a `node_index → weights` map. One entry per mesh-bearing
+/// node the clip animates; nodes without a morph channel are absent.
+///
+/// This is the morph-target counterpart to [`animate_scene_nodes`],
+/// which handles TRS channels only. Run both per frame, then pass the
+/// sampled weights into each draw via `MeshData::morph_weights` (the
+/// map key is the scene node index, so look up by the same node you
+/// used to fetch the world transform).
+///
+/// ```ignore
+/// // Per-frame:
+/// animate_scene_nodes(&mut scene, &clip, t);
+/// let morphs = animate_scene_morph_weights(&clip, t);
+/// let world = scene.compute_world_transforms();
+/// for (node_i, node) in scene.nodes.iter().enumerate() {
+///     let Some(mesh_i) = node.mesh else { continue };
+///     for prim in &arc_meshes[mesh_i] {
+///         let mut per_draw = (**prim).clone();
+///         if let Some(w) = morphs.get(&node_i) {
+///             per_draw.morph_weights = w.clone();
+///         }
+///         ctx.draw_mesh_data(Arc::new(per_draw), world[node_i]);
+///     }
+/// }
+/// ```
+pub fn animate_scene_morph_weights(
+    clip: &GltfAnimation,
+    t: f32,
+) -> std::collections::HashMap<usize, Vec<f32>> {
+    let mut out = std::collections::HashMap::new();
+    for ch in &clip.channels {
+        if ch.target.property != AnimatedProperty::MorphWeights {
+            continue;
+        }
+        if let Some(w) = sample_morph_weights(&ch.sampler, t) {
+            out.insert(ch.target.node, w);
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
