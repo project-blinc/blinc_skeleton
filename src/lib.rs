@@ -377,6 +377,47 @@ impl Pose {
         out
     }
 
+    /// Build a pose by reading the current TRS of each joint's glTF
+    /// node directly from `scene`. This is the right starting point
+    /// for skinned assets whose bind pose is non-trivial — call it
+    /// *after* [`animate_scene_nodes`] to carry the clip's animated
+    /// transforms into the pose, and bones the clip doesn't touch
+    /// keep their authored rest TRS instead of collapsing to identity
+    /// (which is what [`Pose::rest`] would do).
+    ///
+    /// `NodeTransform::Matrix(_)` joints fall back to identity — real
+    /// skeletons export as TRS; this is a defensive carve-out.
+    ///
+    /// ```ignore
+    /// animate_scene_nodes(&mut scene, &clip, t);
+    /// let mut pose = Pose::from_scene(&scene, skin);
+    /// pose.evaluate(&clip, t, skin); // populates pose.morph_weights
+    /// let skinning = pose.skinning_data(&skin.skeleton);
+    /// ```
+    pub fn from_scene(scene: &GltfScene, skin: &GltfSkeleton) -> Self {
+        let mut out = Self::rest(&skin.skeleton);
+        for (bone_idx, &node_idx) in skin.joint_nodes.iter().enumerate() {
+            if bone_idx >= out.joints.len() {
+                break;
+            }
+            if let Some(node) = scene.nodes.get(node_idx) {
+                if let NodeTransform::Trs {
+                    translation,
+                    rotation,
+                    scale,
+                } = node.transform
+                {
+                    out.joints[bone_idx] = JointTransform {
+                        translation,
+                        rotation,
+                        scale,
+                    };
+                }
+            }
+        }
+        out
+    }
+
     /// Sample every applicable channel from `anim` at time `t` and
     /// write the results into this pose.
     ///
