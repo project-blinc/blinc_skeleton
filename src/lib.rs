@@ -38,7 +38,9 @@
 //! let skinning = pose.skinning_matrices(&skin.skeleton);
 //! ```
 
-use blinc_core::draw::{Skeleton, SkinningData};
+use std::sync::Arc;
+
+use blinc_core::draw::{AlphaMode, MeshData, Skeleton, SkinningData};
 use blinc_core::Mat4;
 use blinc_gltf::{
     AnimatedProperty, AnimationSampler, GltfAnimation, GltfScene, GltfSkeleton, NodeTransform,
@@ -1092,6 +1094,142 @@ fn quat_to_mat4(q: [f32; 4]) -> Mat4 {
 
 // Re-export types that downstream code commonly holds alongside a Pose.
 pub use blinc_core::draw::{Bone, Skeleton as CoreSkeleton, SkinningData as CoreSkinningData};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame-draw glue — assembles the per-frame dispatch list for an
+// animated glTF scene. Demos and apps that iterate meshes and stamp
+// skinning / morph weights per draw all reproduce the same ~50 lines;
+// `build_frame_draws` is that boilerplate in one call.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One entry in a frame's mesh dispatch list, produced by
+/// [`build_frame_draws`]. `mesh` already carries the frame's skinning
+/// matrices and morph weights (shallow-cloned from the base primitive
+/// with `Arc<Vec>` buffers refcount-bumped); `transform` is the model
+/// matrix to pass to [`DrawContext::draw_mesh_data`].
+///
+/// Skinned draws come through with `transform = Mat4::IDENTITY` —
+/// per glTF 2.0 the skin matrices already produce world-space
+/// positions, and re-applying the mesh node transform doubles the
+/// transformation.
+pub struct FrameDraw {
+    pub mesh: Arc<MeshData>,
+    pub transform: Mat4,
+}
+
+/// Build the per-frame dispatch list for an animated glTF scene.
+///
+/// Handles, in order:
+/// 1. Sample TRS channels into `scene.nodes` via [`animate_scene_nodes`].
+/// 2. Build one `SkinningData` per skin via [`scene_skinning_data`]
+///    (falls back to the bone-parent path if the scene has no skin).
+/// 3. Sample morph-weight channels via [`animate_scene_morph_weights`].
+/// 4. Shallow-clone each base primitive, stamp skin + morph weights.
+/// 5. Sort opaque/mask draws before BLEND, then back-to-front within
+///    BLEND by camera distance (stabilizes alpha compositing for
+///    hair strands, eye layers, and similar transparent overlays).
+///
+/// `base_meshes[mesh_index][primitive_index]` is the un-animated
+/// primitive taken out of `scene.meshes[i].primitives` at load time
+/// (so later frames don't re-clone vertex data). `Arc<Vec>` fields on
+/// `MeshData` keep per-draw clones cheap.
+///
+/// `camera_pos` is the world-space camera position used for back-to-
+/// front blend sort — pass `pending.camera.position` or whichever the
+/// orbit controller exposes.
+///
+/// Single-skeleton assets (character rigs almost always) work out of
+/// the box. Multi-skeleton scenes use `scene.skeletons[0]` here;
+/// call the underlying primitives directly if that's wrong for your
+/// asset.
+pub fn build_frame_draws(
+    scene: &mut GltfScene,
+    base_meshes: &[Vec<MeshData>],
+    anim: &GltfAnimation,
+    t: f32,
+    camera_pos: [f32; 3],
+) -> Vec<FrameDraw> {
+    // 1. Node TRS from the clip.
+    animate_scene_nodes(scene, anim, t);
+
+    // 2. Skinning — derived from the scene's current world transforms.
+    let skinning = scene
+        .skeletons
+        .first()
+        .map(|skel| scene_skinning_data(scene, skel));
+
+    // 3. Morph weights keyed by mesh-bearing node index.
+    let weights_by_node = animate_scene_morph_weights(anim, t);
+
+    // 4. Build a per-draw MeshData for every mesh-bearing node.
+    let world = scene.compute_world_transforms();
+    let mut opaque: Vec<FrameDraw> = Vec::new();
+    let mut blend: Vec<(FrameDraw, f32)> = Vec::new(); // (draw, z from camera)
+
+    for (node_idx, node) in scene.nodes.iter().enumerate() {
+        let Some(mesh_idx) = node.mesh else { continue };
+        let is_skinned = node.skin.is_some();
+        let node_world = world.get(node_idx).copied().unwrap_or(Mat4::IDENTITY);
+        let draw_xf = if is_skinned { Mat4::IDENTITY } else { node_world };
+        let node_morphs = weights_by_node.get(&node_idx);
+        let Some(prims) = base_meshes.get(mesh_idx) else { continue };
+
+        for prim in prims {
+            let has_morphs = !prim.morph_targets.is_empty();
+            let needs_clone = has_morphs || is_skinned;
+            let mesh_arc = if needs_clone {
+                let mut per_draw = prim.clone();
+                if is_skinned {
+                    if let Some(sd) = &skinning {
+                        per_draw.skin = Some(sd.clone());
+                    }
+                }
+                if has_morphs {
+                    let tc = prim.morph_targets.len();
+                    per_draw.morph_weights = match node_morphs {
+                        Some(w) if w.len() >= tc => w[..tc].to_vec(),
+                        Some(w) => {
+                            let mut v = w.clone();
+                            v.resize(tc, 0.0);
+                            v
+                        }
+                        None => vec![0.0; tc],
+                    };
+                }
+                Arc::new(per_draw)
+            } else {
+                // Still a fresh Arc, but the clone is a shallow
+                // MeshData copy with Arc<Vec> refcount bumps — cheap.
+                Arc::new(prim.clone())
+            };
+
+            let is_blend = matches!(prim.material.alpha_mode, AlphaMode::Blend);
+            let fd = FrameDraw {
+                mesh: mesh_arc,
+                transform: draw_xf,
+            };
+            if is_blend {
+                // Pivot for sorting — the mesh-node translation, which
+                // is close enough for coarse draw-order. Fine-grained
+                // per-triangle sort would be ideal but is O(n log n)
+                // in triangle count and needs a post-morph pass.
+                let tx = node_world.cols[3];
+                let dx = tx[0] - camera_pos[0];
+                let dy = tx[1] - camera_pos[1];
+                let dz = tx[2] - camera_pos[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                blend.push((fd, d2));
+            } else {
+                opaque.push(fd);
+            }
+        }
+    }
+
+    // Back-to-front: larger distance first.
+    blend.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    opaque.extend(blend.into_iter().map(|(fd, _)| fd));
+    opaque
+}
 
 #[cfg(test)]
 mod tests {
