@@ -15,13 +15,13 @@ pipeline.
   `(weight, &Pose)` pairs with un-normalised weights via a running
   accumulator (convex combination maintained through the fold).
 
-- [ ] **Additive blending**
-  - **Why:** Layer an "aiming" clip or "breathing" idle on top of a
-    locomotion base without replacing it.
-  - **How:** Store the *delta* of each joint from a rest reference;
-    apply via `self.translation += delta * weight`,
-    `self.rotation = delta_quat * self.rotation` (weighted).
-    Needs a helper to compute the delta between two poses.
+- [x] **Additive blending** — `Pose::delta(rest, target)` extracts
+  the per-joint offset; `Pose::apply_delta(&delta, weight)` layers
+  it on top of the base pose (translation additive, scale
+  multiplicative via `lerp(1, δ_s, w)`, rotation via
+  `slerp(I, δ_r, w)` local post-multiply). Round-trip tested:
+  applying `delta(rest, target)` to `rest` at weight 1 lands on
+  `target` within fp tolerance.
 
 ---
 

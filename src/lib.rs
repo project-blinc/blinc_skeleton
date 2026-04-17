@@ -191,6 +191,69 @@ impl JointTransform {
         self.rotation = quat_slerp(self.rotation, other.rotation, u);
     }
 
+    /// Compute the per-joint *delta* that takes `rest` to `target`.
+    /// The result isn't a full pose — it's a transform that means
+    /// "translate by Δt, scale by Δs, rotate by Δq", to be layered
+    /// on top of some other base pose via [`Self::apply_delta`].
+    ///
+    /// Translation is subtractive (`target.t − rest.t`); scale is
+    /// multiplicative (`target.s / rest.s`, component-wise) with a
+    /// 1e-6 denominator floor so a degenerate rest scale of 0 doesn't
+    /// blow up; rotation is `conj(rest) · target`, the quaternion
+    /// `q` such that `rest · q = target`.
+    ///
+    /// Typical use: sample the author-provided "aim rest pose" and
+    /// "aim full-right pose" at the same time, call `delta(rest, full)`
+    /// to get the additive overlay, then `apply_delta(&delta, stick_x)`
+    /// on the base locomotion each frame.
+    pub fn delta(rest: &Self, target: &Self) -> Self {
+        let mut s = [1.0; 3];
+        for i in 0..3 {
+            // Floor avoids div-by-zero on pathological rest scales.
+            let d = if rest.scale[i].abs() < 1e-6 {
+                rest.scale[i].signum().max(1e-6)
+            } else {
+                rest.scale[i]
+            };
+            s[i] = target.scale[i] / d;
+        }
+        let mut t = [0.0; 3];
+        for i in 0..3 {
+            t[i] = target.translation[i] - rest.translation[i];
+        }
+        Self {
+            translation: t,
+            rotation: quat_mul(quat_conj(rest.rotation), target.rotation),
+            scale: s,
+        }
+    }
+
+    /// Apply an additive `delta` (from [`Self::delta`]) on top of
+    /// `self`, scaled by `weight`. `weight = 0.0` is a no-op;
+    /// `weight = 1.0` fully layers the delta on.
+    ///
+    /// Math, per-channel:
+    /// - translation: `self.t += delta.t * weight`
+    /// - scale:       `self.s *= lerp(1.0, delta.s, weight)` (so
+    ///   weight 0 multiplies by 1.0 and weight 1 multiplies by the
+    ///   full delta factor)
+    /// - rotation:    `self.r = self.r · slerp(identity, delta.r, weight)`
+    ///   (local post-multiply — the layer rotates in the bone's
+    ///   own frame, then the base places it in the skeleton)
+    ///
+    /// The quaternion is renormalised after the multiply so repeated
+    /// layered calls don't drift.
+    pub fn apply_delta(&mut self, delta: &Self, weight: f32) {
+        for i in 0..3 {
+            self.translation[i] += delta.translation[i] * weight;
+            // lerp(1, delta.s, w) = 1 + w * (delta.s - 1).
+            let factor = 1.0 + weight * (delta.scale[i] - 1.0);
+            self.scale[i] *= factor;
+        }
+        let scaled_delta = quat_slerp([0.0, 0.0, 0.0, 1.0], delta.rotation, weight);
+        self.rotation = normalize4(quat_mul(self.rotation, scaled_delta));
+    }
+
     /// Compose into a column-major 4×4. Uses the same `T · R · S`
     /// convention as `blinc_gltf::NodeTransform::to_mat4`.
     pub fn to_mat4(&self) -> Mat4 {
@@ -336,6 +399,48 @@ impl Pose {
             let frac = w / next_total;
             self.blend(pose, frac);
             weight_seen = next_total;
+        }
+    }
+
+    /// Build a *delta pose* whose per-joint transforms take `rest` to
+    /// `target` via [`JointTransform::delta`]. Feed the result to
+    /// [`Pose::apply_delta`] to layer it on top of a base pose.
+    ///
+    /// The two inputs must share a skeleton — same joint ordering,
+    /// same count. Anything past the shorter list is dropped.
+    ///
+    /// Typical wiring for an "aim" overlay:
+    ///
+    /// ```ignore
+    /// // Authored once at load time from two aim keyframes:
+    /// let aim_layer = Pose::delta(&aim_rest_pose, &aim_full_pose);
+    ///
+    /// // Every frame:
+    /// let mut base = Pose::rest(&skin.skeleton);
+    /// base.evaluate(&locomotion_clip, t, skin);
+    /// base.apply_delta(&aim_layer, aim_strength); // stick_x ∈ [−1, 1]
+    /// let skinning = base.skinning_matrices(&skin.skeleton);
+    /// ```
+    pub fn delta(rest: &Pose, target: &Pose) -> Pose {
+        let n = rest.joints.len().min(target.joints.len());
+        let mut joints = Vec::with_capacity(n);
+        for i in 0..n {
+            joints.push(JointTransform::delta(&rest.joints[i], &target.joints[i]));
+        }
+        Pose { joints }
+    }
+
+    /// Layer `delta` (from [`Pose::delta`] or composed elsewhere) on
+    /// top of this pose at `weight`. Per-joint math matches
+    /// [`JointTransform::apply_delta`]; joints past the shorter pose's
+    /// length are left untouched.
+    ///
+    /// Allocation-free — the result is written into `self` in place.
+    pub fn apply_delta(&mut self, delta: &Pose, weight: f32) {
+        let n = self.joints.len().min(delta.joints.len());
+        for i in 0..n {
+            let d = delta.joints[i];
+            self.joints[i].apply_delta(&d, weight);
         }
     }
 
@@ -570,6 +675,25 @@ fn flatten_mat4(m: Mat4) -> [f32; 16] {
         c[2][0], c[2][1], c[2][2], c[2][3], //
         c[3][0], c[3][1], c[3][2], c[3][3], //
     ]
+}
+
+/// Hamilton product. `quat_mul(a, b)` applies `b` first, then `a`
+/// (i.e. `(ab)v = a(bv)`). Used by the additive-blend path to
+/// compose the local delta with the base rotation.
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let [ax, ay, az, aw] = a;
+    let [bx, by, bz, bw] = b;
+    [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+}
+
+/// Conjugate (inverse for unit quaternions). Negates the vector part.
+fn quat_conj(q: [f32; 4]) -> [f32; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
 }
 
 fn quat_to_mat4(q: [f32; 4]) -> Mat4 {
@@ -811,5 +935,113 @@ mod tests {
         let other = Pose::rest(&skel);
         a.blend_many(&[(0.0, &other)]);
         assert!(approx_eq(a.joints[0].translation[0], 1.0, 1e-5));
+    }
+
+    // ── Additive-blend tests ─────────────────────────────────────────────
+
+    #[test]
+    fn joint_delta_rest_to_target_is_subtractive() {
+        let rest = JointTransform {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [2.0, 2.0, 2.0],
+        };
+        let target = JointTransform {
+            translation: [4.0, 5.0, 7.0],
+            rotation: quat_y(std::f32::consts::FRAC_PI_2),
+            scale: [4.0, 4.0, 4.0],
+        };
+        let d = JointTransform::delta(&rest, &target);
+        assert!(approx_eq(d.translation[0], 3.0, 1e-5));
+        assert!(approx_eq(d.translation[1], 3.0, 1e-5));
+        assert!(approx_eq(d.translation[2], 4.0, 1e-5));
+        // 4 / 2 = 2.
+        assert!(approx_eq(d.scale[0], 2.0, 1e-5));
+        // Rotation delta: conj(identity) · quat_y(90°) = quat_y(90°).
+        assert!(approx_eq(d.rotation[3], std::f32::consts::FRAC_1_SQRT_2, 1e-4));
+    }
+
+    #[test]
+    fn apply_delta_zero_weight_is_identity_op() {
+        let mut base = JointTransform {
+            translation: [10.0, 20.0, 30.0],
+            rotation: quat_y(0.3),
+            scale: [1.5, 1.5, 1.5],
+        };
+        let saved = base;
+        let delta = JointTransform {
+            translation: [1.0, 1.0, 1.0],
+            rotation: quat_y(1.0),
+            scale: [2.0, 2.0, 2.0],
+        };
+        base.apply_delta(&delta, 0.0);
+        for i in 0..3 {
+            assert!(approx_eq(base.translation[i], saved.translation[i], 1e-5));
+            assert!(approx_eq(base.scale[i], saved.scale[i], 1e-5));
+        }
+        for i in 0..4 {
+            assert!(approx_eq(base.rotation[i], saved.rotation[i], 1e-5));
+        }
+    }
+
+    #[test]
+    fn apply_delta_full_weight_lands_on_target_when_base_is_rest() {
+        // Canonical round-trip: extract (rest → target), then apply
+        // that delta to `rest` at weight 1 — you should land on target.
+        let rest = JointTransform {
+            translation: [0.0, 0.0, 0.0],
+            rotation: quat_y(0.0),
+            scale: [1.0, 1.0, 1.0],
+        };
+        let target = JointTransform {
+            translation: [3.0, 4.0, 5.0],
+            rotation: quat_y(std::f32::consts::FRAC_PI_3),
+            scale: [2.0, 2.0, 2.0],
+        };
+        let delta = JointTransform::delta(&rest, &target);
+        let mut reconstructed = rest;
+        reconstructed.apply_delta(&delta, 1.0);
+        assert!(approx_eq(reconstructed.translation[0], target.translation[0], 1e-4));
+        assert!(approx_eq(reconstructed.translation[1], target.translation[1], 1e-4));
+        assert!(approx_eq(reconstructed.translation[2], target.translation[2], 1e-4));
+        assert!(approx_eq(reconstructed.scale[0], target.scale[0], 1e-4));
+        // Rotation: reconstructed should match target up to slight
+        // accumulated floating-point drift in the slerp/mul path.
+        assert!(approx_eq(reconstructed.rotation[3], target.rotation[3], 1e-4));
+    }
+
+    #[test]
+    fn apply_delta_half_weight_is_halfway_on_translation() {
+        let mut base = JointTransform::IDENTITY;
+        let delta = JointTransform {
+            translation: [10.0, 0.0, 0.0],
+            rotation: quat_y(0.0),
+            scale: [1.0, 1.0, 1.0],
+        };
+        base.apply_delta(&delta, 0.5);
+        assert!(approx_eq(base.translation[0], 5.0, 1e-5));
+    }
+
+    #[test]
+    fn pose_apply_delta_layers_onto_animating_base() {
+        // The motivating use-case: base pose is the locomotion
+        // sample; delta is an "aim overlay"; after apply_delta the
+        // translation reflects base + weight * delta.
+        let skel = single_bone_skel();
+        let mut base = Pose::rest(&skel);
+        base.joints[0].translation = [0.0, 5.0, 0.0]; // pretend-walking, bone is 5 up
+
+        let rest = Pose::rest(&skel);
+        let mut full = Pose::rest(&skel);
+        full.joints[0].translation = [0.0, 0.0, 2.0]; // aim pushes forward
+        let aim_delta = Pose::delta(&rest, &full);
+
+        base.apply_delta(&aim_delta, 0.75);
+        // Translation ends at: base + 0.75 * (full − rest)
+        //                    = [0, 5, 0] + 0.75 * [0, 0, 2]
+        //                    = [0, 5, 1.5]
+        assert!(approx_eq(base.joints[0].translation[0], 0.0, 1e-5));
+        assert!(approx_eq(base.joints[0].translation[1], 5.0, 1e-5));
+        assert!(approx_eq(base.joints[0].translation[2], 1.5, 1e-5));
     }
 }
