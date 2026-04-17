@@ -46,24 +46,29 @@ pipeline.
   false`) and under-extension (clamp to minimum bone-length
   difference). `rotation_from_to(from, to) -> quaternion` helper
   exposed for callers converting position deltas to joint rotations.
-- [ ] **Two-bone IK — orientation-aware wrapper on `Pose`.** Follow-
-  up that takes `(skeleton, root_bone, middle_bone, end_bone,
-  target, pole)` and writes new local rotations into the pose,
-  handling the world ↔ local conversion via the joint hierarchy.
-  Depends on a per-pose world-rotation cache to avoid recomputing
-  the ancestor chain.
 
-- [ ] **FABRIK (Forward-And-Backward Reaching IK)**
-  - **Why:** Multi-segment chains (spines, tentacles, tails).
-  - **How:** Iterative forward pass (end → root, pulling each
-    segment's length intact) then backward pass (root → end). 2-4
-    iterations typically suffice.
+- [x] **Two-bone IK — orientation-aware Pose wrapper.**
+  `Pose::solve_two_bone_ik(&skeleton, root, middle, end, target,
+  pole)` writes new local rotations into the pose. Bone lengths
+  extracted from the current pose's world positions (respects any
+  translation animation in place). World→local conversion via
+  `Pose::world_rotations` (added alongside — cheaper than going
+  through `world_matrices` when only rotations are needed).
 
-- [ ] **Look-at constraint**
-  - **Why:** Eye tracking, head follow targets.
-  - **How:** Compute the rotation that aligns a bone's local axis
-    with a world-space direction, apply as a constraint on top of
-    the sampled pose.
+- [x] **FABRIK.** `solve_fabrik(joints, bone_lengths, target,
+  iterations, tolerance) -> bool` in `ik.rs`. Iterative two-pass
+  (forward / backward) position solver for N-segment chains;
+  returns `true` on convergence, `false` on out-of-reach (chain
+  fully extends toward target) or iteration-exhaust. Bone lengths
+  preserved to float tolerance. Anchors the root — backward pass
+  resets root each iteration.
+
+- [x] **Look-at.** `Pose::look_at_bone(&skeleton, bone, target,
+  local_forward)` writes the shortest-arc rotation that aims the
+  bone's `local_forward` axis at the world-space target. No
+  up-vector constraint by design (shortest-arc = minimum twist);
+  layer an up-constraint via `JointTransform::apply_delta` if
+  needed.
 
 ---
 

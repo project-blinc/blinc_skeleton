@@ -185,17 +185,103 @@ pub fn rotation_from_to(from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
     }
 }
 
+/// Solve a multi-segment FABRIK chain in place.
+///
+/// `joints[0]` is the chain's anchor (root); `joints[n-1]` is the
+/// end-effector that should reach `target`. `bone_lengths[i]` is the
+/// distance between `joints[i]` and `joints[i+1]`, extracted once at
+/// setup from the rest pose.
+///
+/// Returns `true` if the end-effector lands within `tolerance` of
+/// `target` inside `iterations` passes. Returns `false` if the
+/// target is out of reach (chain extends fully along the target
+/// direction) or if iterations exhausted without convergence.
+///
+/// Each iteration runs two passes:
+/// 1. **Forward** (end → root): pin the end at `target`, then for
+///    each joint walking toward the root, pull it along the vector
+///    from its child so the joint sits at the correct bone distance.
+/// 2. **Backward** (root → end): pin the root at its original
+///    position, then for each joint walking toward the end, push it
+///    along the vector from its parent at the correct bone distance.
+///
+/// Typical use: 4–8 iterations at `tolerance = 1e-3` is enough for
+/// visually-correct convergence on most rigs. FABRIK converges fast
+/// on non-pathological inputs; for pathological cases (target near
+/// the root, high segment count) bump iterations.
+pub fn solve_fabrik(
+    joints: &mut [[f32; 3]],
+    bone_lengths: &[f32],
+    target: [f32; 3],
+    iterations: u32,
+    tolerance: f32,
+) -> bool {
+    let n = joints.len();
+    if n < 2 || bone_lengths.len() != n - 1 {
+        return false;
+    }
+
+    let root = joints[0];
+    let total_reach: f32 = bone_lengths.iter().sum();
+    let d = v3_length(v3_sub(target, root));
+
+    // Out of reach → extend fully along (target - root).
+    if d > total_reach {
+        let dir = v3_normalise_or(v3_sub(target, root), [0.0, 1.0, 0.0]);
+        let mut cumulative = 0.0;
+        for i in 1..n {
+            cumulative += bone_lengths[i - 1];
+            joints[i] = [
+                root[0] + dir[0] * cumulative,
+                root[1] + dir[1] * cumulative,
+                root[2] + dir[2] * cumulative,
+            ];
+        }
+        return false;
+    }
+
+    for _ in 0..iterations {
+        // Forward pass — pin end at target, pull toward root.
+        joints[n - 1] = target;
+        for i in (0..n - 1).rev() {
+            let dir = v3_normalise_or(v3_sub(joints[i], joints[i + 1]), [0.0, 1.0, 0.0]);
+            joints[i] = [
+                joints[i + 1][0] + dir[0] * bone_lengths[i],
+                joints[i + 1][1] + dir[1] * bone_lengths[i],
+                joints[i + 1][2] + dir[2] * bone_lengths[i],
+            ];
+        }
+
+        // Backward pass — pin root at original, push toward end.
+        joints[0] = root;
+        for i in 1..n {
+            let dir = v3_normalise_or(v3_sub(joints[i], joints[i - 1]), [0.0, 1.0, 0.0]);
+            joints[i] = [
+                joints[i - 1][0] + dir[0] * bone_lengths[i - 1],
+                joints[i - 1][1] + dir[1] * bone_lengths[i - 1],
+                joints[i - 1][2] + dir[2] * bone_lengths[i - 1],
+            ];
+        }
+
+        if v3_length(v3_sub(joints[n - 1], target)) < tolerance {
+            return true;
+        }
+    }
+
+    false
+}
+
 // ── Vec3 helpers — tiny and duplicated rather than pulling a dep ────────
 
-fn v3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn v3_sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn v3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+pub(crate) fn v3_dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn v3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+pub(crate) fn v3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -203,11 +289,11 @@ fn v3_cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn v3_length(v: [f32; 3]) -> f32 {
+pub(crate) fn v3_length(v: [f32; 3]) -> f32 {
     v3_dot(v, v).sqrt()
 }
 
-fn v3_normalise_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+pub(crate) fn v3_normalise_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
     let len = v3_length(v);
     if len < 1e-6 {
         fallback
@@ -309,5 +395,62 @@ mod tests {
         // Axis length should be 1.
         let axis_len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
         assert!((axis_len - 1.0).abs() < 1e-5);
+    }
+
+    // ── FABRIK tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn fabrik_reaches_target_when_in_range() {
+        // 3-segment chain along +X at rest, total reach = 3. Target
+        // at (1, 1, 0) should converge within a couple of iterations.
+        let mut joints = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        let lengths = [1.0, 1.0, 1.0];
+        let reached = solve_fabrik(&mut joints, &lengths, [1.0, 1.0, 0.0], 16, 1e-3);
+        assert!(reached);
+        assert!(approx_v3(joints[3], [1.0, 1.0, 0.0], 1e-3));
+        // Bone lengths should be preserved.
+        for i in 0..3 {
+            let l = v3_length(v3_sub(joints[i + 1], joints[i]));
+            assert!((l - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn fabrik_extends_when_target_unreachable() {
+        // 3-segment chain, total reach 3; target at (10, 0, 0).
+        let mut joints = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]];
+        let lengths = [1.0, 1.0, 1.0];
+        let reached = solve_fabrik(&mut joints, &lengths, [10.0, 0.0, 0.0], 16, 1e-3);
+        assert!(!reached);
+        // Chain should be fully extended along +X.
+        assert!(approx_v3(joints[1], [1.0, 0.0, 0.0], 1e-3));
+        assert!(approx_v3(joints[2], [2.0, 0.0, 0.0], 1e-3));
+        assert!(approx_v3(joints[3], [3.0, 0.0, 0.0], 1e-3));
+    }
+
+    #[test]
+    fn fabrik_preserves_root_position() {
+        // 4-segment chain — make sure the root never drifts.
+        let mut joints = [
+            [0.5, 0.5, 0.0],
+            [1.5, 0.5, 0.0],
+            [2.5, 0.5, 0.0],
+            [3.5, 0.5, 0.0],
+            [4.5, 0.5, 0.0],
+        ];
+        let lengths = [1.0, 1.0, 1.0, 1.0];
+        solve_fabrik(&mut joints, &lengths, [2.0, 2.0, 0.5], 8, 1e-3);
+        assert!(approx_v3(joints[0], [0.5, 0.5, 0.0], 1e-4));
+    }
+
+    #[test]
+    fn fabrik_no_op_on_bad_inputs() {
+        let mut joints = [[0.0, 0.0, 0.0]];
+        let lengths = [];
+        assert!(!solve_fabrik(&mut joints, &lengths, [1.0, 0.0, 0.0], 4, 1e-3));
+        // Mismatched lengths count → no-op.
+        let mut joints2 = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]];
+        let bad_lengths = [1.0];
+        assert!(!solve_fabrik(&mut joints2, &bad_lengths, [0.5, 0.5, 0.0], 4, 1e-3));
     }
 }

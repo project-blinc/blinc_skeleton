@@ -49,8 +49,10 @@ mod ik;
 mod sample;
 
 pub use densify::{densify_one_channel, densify_rotation_channels, MAX_SEG_RAD};
-pub use ik::{rotation_from_to, solve_two_bone, TwoBoneSolution};
+pub use ik::{rotation_from_to, solve_fabrik, solve_two_bone, TwoBoneSolution};
 pub use sample::{normalize4, quat_slerp, Sampled};
+
+use ik::{v3_length, v3_normalise_or, v3_sub};
 
 /// Sample an animation channel's sampler at time `t`, returning the
 /// interpolated value. Returns `None` when the sampler has zero
@@ -446,6 +448,186 @@ impl Pose {
         }
     }
 
+    /// Compose each joint's local rotation with its ancestor chain
+    /// to produce per-joint world-space quaternions.
+    ///
+    /// Cheaper than [`Self::world_matrices`] when callers only need
+    /// rotations (IK solvers, constraint math) — stays in quaternion
+    /// space instead of building full 4×4 matrices and extracting the
+    /// rotation component.
+    pub fn world_rotations(&self, skeleton: &Skeleton) -> Vec<[f32; 4]> {
+        let n = self.joints.len().min(skeleton.bones.len());
+        let mut world = vec![[0.0, 0.0, 0.0, 1.0]; n];
+        for i in 0..n {
+            let local = self.joints[i].rotation;
+            world[i] = if let Some(p) = skeleton.bones[i].parent {
+                if p < i {
+                    normalize4(quat_mul(world[p], local))
+                } else {
+                    local
+                }
+            } else {
+                local
+            };
+        }
+        world
+    }
+
+    /// Solve a two-bone IK chain (root → middle → end) and write the
+    /// resulting local rotations back into this pose.
+    ///
+    /// Positions and the pole are interpreted in world space — same
+    /// coordinate system as the pose's `world_matrices`. Bone lengths
+    /// are extracted from the *current* pose (not the rest pose), so
+    /// IK respects any translation animation already in place.
+    ///
+    /// Silently no-ops if any bone index is out of range. End's
+    /// rotation is left untouched (only root and middle are
+    /// reoriented to get end to `target`).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Foot-placement: anchor the foot to a ground-trace point
+    /// // while the leg bends naturally.
+    /// let ground = raycast_down(body_position);
+    /// let knee_pole = body_position + body_forward * 0.3; // knees forward
+    /// pose.solve_two_bone_ik(
+    ///     &skin.skeleton,
+    ///     hip_bone,
+    ///     knee_bone,
+    ///     foot_bone,
+    ///     ground,
+    ///     knee_pole,
+    /// );
+    /// ```
+    pub fn solve_two_bone_ik(
+        &mut self,
+        skeleton: &Skeleton,
+        root: usize,
+        middle: usize,
+        end: usize,
+        target: [f32; 3],
+        pole: [f32; 3],
+    ) {
+        let joint_count = self.joints.len().min(skeleton.bones.len());
+        if root >= joint_count || middle >= joint_count || end >= joint_count {
+            return;
+        }
+
+        let world_mats = self.world_matrices(skeleton);
+        let world_rots = self.world_rotations(skeleton);
+
+        // Extract world-space positions from the translation column
+        // of each joint's world matrix.
+        let world_pos = |i: usize| -> [f32; 3] {
+            let c = world_mats[i].cols[3];
+            [c[0], c[1], c[2]]
+        };
+        let root_pos = world_pos(root);
+        let middle_pos = world_pos(middle);
+        let end_pos = world_pos(end);
+
+        let upper_dir = v3_sub(middle_pos, root_pos);
+        let lower_dir = v3_sub(end_pos, middle_pos);
+        let l_upper = v3_length(upper_dir);
+        let l_lower = v3_length(lower_dir);
+
+        if l_upper < 1e-5 || l_lower < 1e-5 {
+            return;
+        }
+
+        let sol = ik::solve_two_bone(root_pos, l_upper, l_lower, target, pole);
+
+        // World-space rotation delta for the root joint: rotate the
+        // upper-bone direction from its current orientation onto the
+        // solve's desired direction.
+        let current_upper_dir = v3_normalise_or(upper_dir, [0.0, 1.0, 0.0]);
+        let desired_upper_dir = v3_normalise_or(v3_sub(sol.middle, root_pos), [0.0, 1.0, 0.0]);
+        let root_delta_world = ik::rotation_from_to(current_upper_dir, desired_upper_dir);
+
+        // After root rotates, the lower bone's world direction picks
+        // up that rotation. The middle's own delta is whatever gets
+        // the already-rotated lower onto the solve's desired direction.
+        let current_lower_dir = v3_normalise_or(lower_dir, [0.0, 1.0, 0.0]);
+        let lower_after_root = quat_rotate_vec(root_delta_world, current_lower_dir);
+        let desired_lower_dir = v3_normalise_or(v3_sub(sol.end, sol.middle), [0.0, 1.0, 0.0]);
+        let middle_delta_world = ik::rotation_from_to(lower_after_root, desired_lower_dir);
+
+        // Convert world-space deltas back to joint-local rotations
+        // via the skeleton hierarchy. The root's parent world rotation
+        // is identity when the root bone has no parent.
+        let parent_world_rot = skeleton.bones[root]
+            .parent
+            .and_then(|p| world_rots.get(p).copied())
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let current_world_root_rot = world_rots[root];
+        let new_world_root_rot =
+            normalize4(quat_mul(root_delta_world, current_world_root_rot));
+        let new_local_root_rot =
+            normalize4(quat_mul(quat_conj(parent_world_rot), new_world_root_rot));
+
+        let current_world_middle_rot = world_rots[middle];
+        // Middle's world rotation after the root has applied its delta,
+        // but before middle's own delta, is `root_delta_world · current_middle`.
+        let middle_after_root = quat_mul(root_delta_world, current_world_middle_rot);
+        let new_world_middle_rot = normalize4(quat_mul(middle_delta_world, middle_after_root));
+        let new_local_middle_rot =
+            normalize4(quat_mul(quat_conj(new_world_root_rot), new_world_middle_rot));
+
+        self.joints[root].rotation = new_local_root_rot;
+        self.joints[middle].rotation = new_local_middle_rot;
+    }
+
+    /// Aim a single bone's `local_forward` axis at a world-space
+    /// target, writing the resulting local rotation into the pose.
+    ///
+    /// `local_forward` is the bone's "look direction" in its own
+    /// local frame — e.g. `[0.0, 0.0, 1.0]` for an eye that faces +Z
+    /// when un-rotated, or `[1.0, 0.0, 0.0]` for a head where the
+    /// forward axis points down +X at rest. Pick whichever axis the
+    /// rig authored as forward.
+    ///
+    /// This is a "shortest-arc" look-at: no up-vector constraint, so
+    /// the bone may roll around the forward axis as the target moves.
+    /// For an eye that's fine; for a head you usually want an
+    /// additional up-constraint, which layers on top via
+    /// [`JointTransform::apply_delta`].
+    ///
+    /// Silently no-ops if `bone` is out of range.
+    pub fn look_at_bone(
+        &mut self,
+        skeleton: &Skeleton,
+        bone: usize,
+        target: [f32; 3],
+        local_forward: [f32; 3],
+    ) {
+        let joint_count = self.joints.len().min(skeleton.bones.len());
+        if bone >= joint_count {
+            return;
+        }
+        let world_mats = self.world_matrices(skeleton);
+        let world_rots = self.world_rotations(skeleton);
+
+        let bone_pos = {
+            let c = world_mats[bone].cols[3];
+            [c[0], c[1], c[2]]
+        };
+        // Current world forward = bone's world rotation applied to local_forward.
+        let current_forward_world = quat_rotate_vec(world_rots[bone], local_forward);
+        let desired_forward_world = v3_sub(target, bone_pos);
+        let delta_world = ik::rotation_from_to(current_forward_world, desired_forward_world);
+
+        let parent_world_rot = skeleton.bones[bone]
+            .parent
+            .and_then(|p| world_rots.get(p).copied())
+            .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        let new_world_rot = normalize4(quat_mul(delta_world, world_rots[bone]));
+        let new_local_rot =
+            normalize4(quat_mul(quat_conj(parent_world_rot), new_world_rot));
+        self.joints[bone].rotation = new_local_rot;
+    }
+
     /// Compose each joint's local transform with its ancestor chain
     /// to produce per-joint world-space 4×4 matrices.
     pub fn world_matrices(&self, skeleton: &Skeleton) -> Vec<Mat4> {
@@ -682,7 +864,7 @@ fn flatten_mat4(m: Mat4) -> [f32; 16] {
 /// Hamilton product. `quat_mul(a, b)` applies `b` first, then `a`
 /// (i.e. `(ab)v = a(bv)`). Used by the additive-blend path to
 /// compose the local delta with the base rotation.
-fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+pub(crate) fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     let [ax, ay, az, aw] = a;
     let [bx, by, bz, bw] = b;
     [
@@ -694,8 +876,27 @@ fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 }
 
 /// Conjugate (inverse for unit quaternions). Negates the vector part.
-fn quat_conj(q: [f32; 4]) -> [f32; 4] {
+pub(crate) fn quat_conj(q: [f32; 4]) -> [f32; 4] {
     [-q[0], -q[1], -q[2], q[3]]
+}
+
+/// Rotate a vector by a unit quaternion via the classic
+/// `v' = v + 2·qxyz × (qxyz × v + qw·v)` formula. Used by the IK
+/// Pose wrappers to compute "what direction does a child bone face
+/// after the parent rotates".
+pub(crate) fn quat_rotate_vec(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let qxyz = [q[0], q[1], q[2]];
+    let inner = [
+        qxyz[1] * v[2] - qxyz[2] * v[1] + q[3] * v[0],
+        qxyz[2] * v[0] - qxyz[0] * v[2] + q[3] * v[1],
+        qxyz[0] * v[1] - qxyz[1] * v[0] + q[3] * v[2],
+    ];
+    let outer = [
+        qxyz[1] * inner[2] - qxyz[2] * inner[1],
+        qxyz[2] * inner[0] - qxyz[0] * inner[2],
+        qxyz[0] * inner[1] - qxyz[1] * inner[0],
+    ];
+    [v[0] + 2.0 * outer[0], v[1] + 2.0 * outer[1], v[2] + 2.0 * outer[2]]
 }
 
 fn quat_to_mat4(q: [f32; 4]) -> Mat4 {
@@ -1022,6 +1223,106 @@ mod tests {
         };
         base.apply_delta(&delta, 0.5);
         assert!(approx_eq(base.translation[0], 5.0, 1e-5));
+    }
+
+    // ── IK Pose wrapper tests ────────────────────────────────────────────
+
+    fn three_bone_skel_chain() -> Skeleton {
+        // Root at origin, middle at (2, 0, 0), end at (4, 0, 0) —
+        // chain along +X with bone lengths 2 and 2. Identity IBMs
+        // mean inverse_bind just places each joint at its rest pos.
+        // The pose itself carries the rest translations.
+        Skeleton {
+            bones: vec![
+                Bone {
+                    name: "root".into(),
+                    parent: None,
+                    inverse_bind_matrix: identity16(),
+                },
+                Bone {
+                    name: "middle".into(),
+                    parent: Some(0),
+                    inverse_bind_matrix: identity16(),
+                },
+                Bone {
+                    name: "end".into(),
+                    parent: Some(1),
+                    inverse_bind_matrix: identity16(),
+                },
+            ],
+        }
+    }
+
+    fn chain_rest_pose(skel: &Skeleton) -> Pose {
+        // Joint 0 at origin with no local translation.
+        // Joint 1 translated (2, 0, 0) in parent frame.
+        // Joint 2 translated (2, 0, 0) in joint 1's frame.
+        let mut pose = Pose::rest(skel);
+        pose.joints[1].translation = [2.0, 0.0, 0.0];
+        pose.joints[2].translation = [2.0, 0.0, 0.0];
+        pose
+    }
+
+    #[test]
+    fn pose_solve_two_bone_ik_reaches_target() {
+        let skel = three_bone_skel_chain();
+        let mut pose = chain_rest_pose(&skel);
+
+        // Target at (2, 2, 0) — in reach (|target| = 2.83, max reach 4).
+        pose.solve_two_bone_ik(&skel, 0, 1, 2, [2.0, 2.0, 0.0], [0.0, 5.0, 0.0]);
+
+        // After IK, end joint's world position should be near target.
+        let world = pose.world_matrices(&skel);
+        let end_pos = [world[2].cols[3][0], world[2].cols[3][1], world[2].cols[3][2]];
+        assert!(
+            approx_eq(end_pos[0], 2.0, 1e-3),
+            "end x = {} (expected ~2.0)",
+            end_pos[0]
+        );
+        assert!(
+            approx_eq(end_pos[1], 2.0, 1e-3),
+            "end y = {} (expected ~2.0)",
+            end_pos[1]
+        );
+    }
+
+    #[test]
+    fn pose_solve_two_bone_ik_out_of_range_is_noop_structure() {
+        let skel = three_bone_skel_chain();
+        let mut pose = chain_rest_pose(&skel);
+        // Bad indices → no-op.
+        pose.solve_two_bone_ik(&skel, 0, 1, 9, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let rot0 = pose.joints[0].rotation;
+        assert!(approx_eq(rot0[3], 1.0, 1e-5)); // still identity
+    }
+
+    #[test]
+    fn pose_look_at_bone_points_forward_at_target() {
+        let skel = three_bone_skel_chain();
+        let mut pose = chain_rest_pose(&skel);
+        // Aim the root's +X axis at a point to the +Z side — should
+        // produce a ~90° rotation around -Y.
+        pose.look_at_bone(&skel, 0, [0.0, 0.0, 5.0], [1.0, 0.0, 0.0]);
+        // After rotation, applying the joint's rotation to [1, 0, 0]
+        // should produce a vector pointing toward +Z.
+        let rotated = quat_rotate_vec(pose.joints[0].rotation, [1.0, 0.0, 0.0]);
+        assert!(approx_eq(rotated[0], 0.0, 1e-3));
+        assert!(approx_eq(rotated[2], 1.0, 1e-3));
+    }
+
+    #[test]
+    fn pose_world_rotations_composes_parents() {
+        let skel = three_bone_skel_chain();
+        let mut pose = chain_rest_pose(&skel);
+        // Rotate root by 90° around +Y. Middle's world rotation should
+        // pick up that rotation even though its local is identity.
+        pose.joints[0].rotation = quat_y(std::f32::consts::FRAC_PI_2);
+        let world_rots = pose.world_rotations(&skel);
+        // Both root and middle should carry the same world rotation
+        // (middle is a direct child with identity local).
+        for i in 0..4 {
+            assert!(approx_eq(world_rots[0][i], world_rots[1][i], 1e-5));
+        }
     }
 
     #[test]
