@@ -111,11 +111,19 @@ pipeline.
     `skinning_matrices`. Pre-allocate scratch buffers on `Player`
     and reuse.
 
-- [ ] **Keyframe cursor**
-  - Linear scan in `bracket` is O(n) per sample. Cache the last-hit
-    keyframe index per channel and bias the search from there.
-    Usually the cursor advances by 1 keyframe per frame; this makes
-    the sample path O(1) in the common case.
+- [x] **Keyframe bracket: binary search.** `bracket()` in `sample.rs`
+  now uses `slice::partition_point` for O(log n) per call on the
+  guaranteed-monotonic `times` array. Covers the worst case with
+  zero API change. For a 1000-keyframe channel that's ~10
+  comparisons per sample instead of ~500 under the old linear scan.
+
+- [ ] **Keyframe cursor (further optimization).** Amortized O(1) in
+  the common case of monotonically-advancing clip time. Needs
+  per-channel cursor state plumbed through either `Pose` or a
+  dedicated `Cursor` handle — meaningful extra ergonomic surface
+  compared to the zero-API-change binary search above. Worth
+  doing if profiling ever shows the log-n bracket path as a hot
+  spot (unlikely for typical ~100-keyframe channels).
 
 - [ ] **SIMD quaternion slerp / matrix multiply**
   - After the cursor optimization lands, the next hot path is the

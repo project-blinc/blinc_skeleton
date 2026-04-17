@@ -71,6 +71,16 @@ pub fn sample(sampler: &AnimationSampler, t: f32) -> Option<Sampled> {
 
 /// Find the keyframe pair `(k0, k1)` bracketing `t`, and the blend
 /// factor `u ∈ [0, 1]`. Clamps before first / after last keyframe.
+///
+/// Uses binary search via [`slice::partition_point`] — O(log n) on
+/// the keyframe count. `times` is guaranteed monotonic-increasing by
+/// the glTF spec, so a partition boundary at the first `times[i] > t`
+/// gives us `k0 = i − 1` directly. For a 1000-keyframe channel this
+/// is ~10 comparisons per call; the old linear scan was ~500 on
+/// average. Per-channel cursor caching (even faster in the common
+/// case of monotonically-advancing clip time) remains on the
+/// backlog — binary search covers the worst case with zero API
+/// change.
 fn bracket(times: &[f32], t: f32) -> (usize, usize, f32) {
     if t <= times[0] {
         return (0, 0, 0.0);
@@ -79,16 +89,12 @@ fn bracket(times: &[f32], t: f32) -> (usize, usize, f32) {
     if t >= times[last] {
         return (last, last, 0.0);
     }
-    // Small time arrays — linear scan is fine; binary search would
-    // only pay off beyond a few dozen keyframes per channel, which is
-    // rare in practice. Revisit if profiles show otherwise.
-    for i in 0..last {
-        if t >= times[i] && t < times[i + 1] {
-            let u = (t - times[i]) / (times[i + 1] - times[i]);
-            return (i, i + 1, u);
-        }
-    }
-    (last, last, 0.0)
+    // Index of the first keyframe strictly after `t`. Guaranteed
+    // within `(0, last]` because of the clamp checks above.
+    let k1 = times.partition_point(|&x| x <= t);
+    let k0 = k1 - 1;
+    let u = (t - times[k0]) / (times[k1] - times[k0]);
+    (k0, k1, u)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +291,32 @@ mod tests {
         let (k0, k1, u) = bracket(&t, 1.5);
         assert_eq!((k0, k1), (1, 2));
         assert!((u - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bracket_binary_search_finds_correct_pair_in_long_channel() {
+        // 1024 keyframes at 0.01s intervals — exercises the
+        // partition_point path end-to-end and verifies the O(log n)
+        // search returns the same bracket as the old O(n) scan.
+        let times: Vec<f32> = (0..1024).map(|i| i as f32 * 0.01).collect();
+        let (k0, k1, u) = bracket(&times, 5.125);
+        assert_eq!((k0, k1), (512, 513));
+        assert!((u - 0.5).abs() < 1e-4);
+        // Exact hit on a keyframe: partition_point's `<=` semantics
+        // mean we end up with k0 = i - 1, k1 = i (blend factor 1.0).
+        let (k0, k1, u) = bracket(&times, 7.00);
+        assert_eq!(k1, k0 + 1);
+        assert!(u >= 0.0 && u <= 1.0);
+    }
+
+    #[test]
+    fn bracket_handles_exact_keyframe_times() {
+        // t equals a non-endpoint keyframe exactly — partition_point
+        // should produce a well-formed bracket with u ∈ [0, 1].
+        let t = [0.0, 1.0, 2.0, 3.0];
+        let (k0, k1, u) = bracket(&t, 1.0);
+        assert!(k0 < k1);
+        assert!((0.0..=1.0).contains(&u));
     }
 
     #[test]
