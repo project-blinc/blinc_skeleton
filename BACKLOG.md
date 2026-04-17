@@ -27,13 +27,22 @@ pipeline.
 
 ## Morph-target support
 
-- [ ] **Morph-weight channel sink on `Pose`**
-  - **Why:** Facial expressions, blend shapes. Already parsed by
-    blinc_gltf; just needs a home to write to.
-  - **How:** Add `morph_weights: Vec<f32>` on `Pose` (sized by the
-    mesh's morph-target count). Wire the `AnimatedProperty::MorphWeights`
-    match arm to write into it. Renderer-side: `MeshData` grows a
-    `morph_weights` field, shader applies delta positions.
+- [x] **Morph-weight channel sink on `Pose` (data flow).**
+  `Pose::morph_weights: HashMap<usize, Vec<f32>>` keyed by scene node
+  index (not bone index — morphs belong to meshes, which live on
+  nodes). `Pose::evaluate` routes `AnimatedProperty::MorphWeights`
+  channels here via the `sample_morph_weights` helper. Companion
+  work in `blinc_core` (`MorphTarget` struct + `MeshData::morph_targets`
+  field) and `blinc_gltf` (parse primitive morph targets into those
+  fields) shipped together.
+
+- [ ] **Morph-target GPU rendering (Phase 2).** Mesh shader samples
+  `MeshData::morph_targets` per vertex and computes
+  `final = base + Σ weights[t]·delta[t]`. Needs blinc_gpu uniform +
+  per-vertex sampling of a morph-delta storage buffer (or a
+  data-texture path for the WebGL2 fallback). Not started —
+  visually-verifiable via Khronos's `AnimatedMorphCube` sample once
+  the shader lands.
 
 ---
 

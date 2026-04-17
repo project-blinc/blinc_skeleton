@@ -281,14 +281,21 @@ impl JointTransform {
 // Pose
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A full skeleton pose — one `JointTransform` per bone.
+/// A full skeleton pose — one `JointTransform` per bone, plus a
+/// side-table of per-node morph weights.
 ///
 /// Poses are built from the rest pose via [`Pose::rest`], modified by
 /// sampling animations via [`Pose::evaluate`], and finalized into
 /// world / skinning matrices when the renderer needs them.
+///
+/// Morph weights are keyed by *scene node index* (not bone index) —
+/// a node carries a `mesh`, and a mesh owns the morph targets. The
+/// map is dynamically sized by `evaluate` as `MorphWeights` channels
+/// are encountered; meshes without morph data produce an empty map.
 #[derive(Debug, Clone)]
 pub struct Pose {
     pub joints: Vec<JointTransform>,
+    pub morph_weights: std::collections::HashMap<usize, Vec<f32>>,
 }
 
 impl Pose {
@@ -301,7 +308,15 @@ impl Pose {
     pub fn rest(skeleton: &Skeleton) -> Self {
         Self {
             joints: vec![JointTransform::IDENTITY; skeleton.bones.len()],
+            morph_weights: std::collections::HashMap::new(),
         }
+    }
+
+    /// Read the weights written for `node` by the last
+    /// [`Self::evaluate`] call. Returns `None` if the clip didn't
+    /// animate morph weights on that node.
+    pub fn morph_weights_for_node(&self, node: usize) -> Option<&[f32]> {
+        self.morph_weights.get(&node).map(Vec::as_slice)
     }
 
     /// Build a pose from the per-joint node transforms already parsed
@@ -329,6 +344,16 @@ impl Pose {
     pub fn evaluate(&mut self, anim: &GltfAnimation, t: f32, skin: &GltfSkeleton) {
         let bone_by_node = build_lookup(&skin.joint_nodes);
         for channel in &anim.channels {
+            // Morph-weights channels target mesh-bearing nodes — they
+            // don't live on the skeleton's joint list, so we route
+            // them to the pose's per-node morph-weight sink instead
+            // of the joint-TRS sink below.
+            if channel.target.property == AnimatedProperty::MorphWeights {
+                if let Some(weights) = sample_morph_weights(&channel.sampler, t) {
+                    self.morph_weights.insert(channel.target.node, weights);
+                }
+                continue;
+            }
             let Some(&bone_idx) = bone_by_node.get(&channel.target.node) else {
                 continue;
             };
@@ -433,7 +458,10 @@ impl Pose {
         for i in 0..n {
             joints.push(JointTransform::delta(&rest.joints[i], &target.joints[i]));
         }
-        Pose { joints }
+        Pose {
+            joints,
+            morph_weights: std::collections::HashMap::new(),
+        }
     }
 
     /// Layer `delta` (from [`Pose::delta`] or composed elsewhere) on
@@ -820,13 +848,23 @@ fn apply_sample(
         (AnimatedProperty::Translation, Sampled::Vec3(v)) => joint.translation = v,
         (AnimatedProperty::Scale, Sampled::Vec3(v)) => joint.scale = v,
         (AnimatedProperty::Rotation, Sampled::Vec4(q)) => joint.rotation = normalize4(q),
-        // Morph weights don't live on JointTransform — they're a
-        // mesh-level channel. A future revision will expose a
-        // MorphWeights sink on `Pose`; for now, silently skip.
-        (AnimatedProperty::MorphWeights, Sampled::Scalars(_)) => {}
-        // Type mismatches (e.g. translation channel with Vec4 values)
-        // are invalid glTF; skip defensively rather than panic.
+        // MorphWeights channels are intercepted by `Pose::evaluate`
+        // and routed to the per-node morph-weights sink — they never
+        // reach this helper. Same for type mismatches (e.g. a
+        // translation channel carrying Vec4 values, which is invalid
+        // glTF) — skip defensively rather than panic.
         _ => {}
+    }
+}
+
+/// Sample a morph-weights channel and return the interpolated weight
+/// vector at time `t`. The sampler's values are scalars laid out as
+/// `times.len() * weight_count` contiguous floats; the returned slice
+/// is exactly one weight-block wide (`weight_count` entries).
+fn sample_morph_weights(sampler: &AnimationSampler, t: f32) -> Option<Vec<f32>> {
+    match sample::sample(sampler, t)? {
+        Sampled::Scalars(v) => Some(v),
+        _ => None,
     }
 }
 
@@ -1106,7 +1144,10 @@ mod tests {
         let mut a = Pose::rest(&skel);
         a.joints[0].translation = [7.0, 0.0, 0.0];
         // Synthetic: build a zero-joint Pose and blend — self shouldn't move.
-        let b = Pose { joints: vec![] };
+        let b = Pose {
+            joints: vec![],
+            morph_weights: std::collections::HashMap::new(),
+        };
         a.blend(&b, 1.0);
         assert!(approx_eq(a.joints[0].translation[0], 7.0, 1e-5));
     }
@@ -1325,6 +1366,61 @@ mod tests {
         for i in 0..4 {
             assert!(approx_eq(world_rots[0][i], world_rots[1][i], 1e-5));
         }
+    }
+
+    #[test]
+    fn pose_evaluate_sinks_morph_weights_by_node() {
+        use blinc_gltf::{
+            AnimationChannel, AnimationSampler, AnimationTarget, Interpolation, KeyframeValues,
+        };
+
+        // Single-joint skin; clip drives a morph-weights channel on
+        // a non-joint node. Tests that the pose routes the scalar
+        // samples into the per-node sink rather than trying to cram
+        // them into a joint-TRS slot.
+        let skel = GltfSkeleton {
+            name: None,
+            skeleton: Skeleton {
+                bones: vec![Bone {
+                    name: "bone".into(),
+                    parent: None,
+                    inverse_bind_matrix: identity16(),
+                }],
+            },
+            joint_nodes: vec![0],
+        };
+        // 3 morph targets; two keyframes — at t=0 all zero, at t=1
+        // the three weights are [1, 0.5, 0]. Linear interp gives
+        // [0.5, 0.25, 0] at t=0.5.
+        let clip = blinc_gltf::GltfAnimation {
+            name: None,
+            channels: vec![AnimationChannel {
+                target: AnimationTarget {
+                    node: 42, // not a joint — goes to morph sink
+                    property: AnimatedProperty::MorphWeights,
+                },
+                sampler: AnimationSampler {
+                    times: vec![0.0, 1.0],
+                    values: KeyframeValues::Scalars(vec![
+                        0.0, 0.0, 0.0, // t=0
+                        1.0, 0.5, 0.0, // t=1
+                    ]),
+                    interpolation: Interpolation::Linear,
+                },
+            }],
+        };
+
+        let mut pose = Pose::rest(&skel.skeleton);
+        pose.evaluate(&clip, 0.5, &skel);
+
+        let weights = pose.morph_weights_for_node(42).expect("weights present");
+        assert_eq!(weights.len(), 3);
+        assert!(approx_eq(weights[0], 0.5, 1e-4));
+        assert!(approx_eq(weights[1], 0.25, 1e-4));
+        assert!(approx_eq(weights[2], 0.0, 1e-4));
+
+        // Non-MorphWeights node shouldn't have an entry.
+        assert!(pose.morph_weights_for_node(0).is_none());
     }
 
     #[test]
