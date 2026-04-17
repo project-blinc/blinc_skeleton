@@ -7,18 +7,13 @@ pipeline.
 
 ## Blending + layering
 
-- [ ] **Weighted blend of two poses**
-  - **Why:** Walk → run transitions, locomotion blending, attack
-    chains. Can't cross-fade animations without it.
-  - **How:** `Pose::blend(&mut self, other: &Pose, weight: f32)`
-    does per-joint lerp on translation / scale and `quat_slerp` on
-    rotation. Weight 0 → self unchanged, weight 1 → fully `other`.
-    Tests against an identity → 90° Y-rotation case.
+- [x] **Weighted blend of two poses** — `Pose::blend` +
+  `JointTransform::blend`, per-joint lerp / slerp, tested
+  identity → 90°-Y at 50% weight.
 
-- [ ] **Blend tree / N-way blend**
-  - **Why:** Directional locomotion (8-way strafe), animation graphs.
-  - **How:** Repeated `blend` with normalized weights, or a dedicated
-    `blend_many(poses: &[(f32, &Pose)])`.
+- [x] **Blend tree / N-way blend** — `Pose::blend_many` folds
+  `(weight, &Pose)` pairs with un-normalised weights via a running
+  accumulator (convex combination maintained through the fold).
 
 - [ ] **Additive blending**
   - **Why:** Layer an "aiming" clip or "breathing" idle on top of a

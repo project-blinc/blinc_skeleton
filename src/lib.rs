@@ -171,6 +171,26 @@ impl JointTransform {
         scale: [1.0; 3],
     };
 
+    /// Linearly interpolate this joint toward `other` by `weight`.
+    /// `weight = 0.0` leaves `self` unchanged; `weight = 1.0` replaces
+    /// it with `other`; intermediate values blend per-component on
+    /// translation / scale and slerp on rotation. The output
+    /// quaternion is renormalised, so repeated blends don't drift.
+    ///
+    /// Values outside `[0, 1]` aren't clamped — they extrapolate, which
+    /// is occasionally useful (e.g. anticipation overshoot on an
+    /// action follow-through). Pass a clamped weight if extrapolation
+    /// would break the downstream rig.
+    pub fn blend(&mut self, other: &Self, weight: f32) {
+        let u = weight;
+        let inv = 1.0 - u;
+        for i in 0..3 {
+            self.translation[i] = self.translation[i] * inv + other.translation[i] * u;
+            self.scale[i] = self.scale[i] * inv + other.scale[i] * u;
+        }
+        self.rotation = quat_slerp(self.rotation, other.rotation, u);
+    }
+
     /// Compose into a column-major 4×4. Uses the same `T · R · S`
     /// convention as `blinc_gltf::NodeTransform::to_mat4`.
     pub fn to_mat4(&self) -> Mat4 {
@@ -247,6 +267,75 @@ impl Pose {
                 continue;
             };
             apply_sample(&channel.sampler, t, channel.target.property, joint);
+        }
+    }
+
+    /// Blend this pose toward `other` by `weight`. Every joint pair
+    /// gets a per-channel lerp on translation / scale and a slerp on
+    /// rotation (see [`JointTransform::blend`] for the single-joint
+    /// version). Joints past the shorter pose's length are left
+    /// untouched — skeletons of different sizes can't sensibly blend,
+    /// and silently mapping by index would produce garbage.
+    ///
+    /// Typical use is sampling two clips at the same scene time into
+    /// two separate poses and crossfading:
+    ///
+    /// ```ignore
+    /// let mut walk = Pose::rest(&skin.skeleton);
+    /// walk.evaluate(&walk_clip, t, skin);
+    /// let mut run = Pose::rest(&skin.skeleton);
+    /// run.evaluate(&run_clip, t, skin);
+    /// walk.blend(&run, run_weight);  // walk → walk+run mix
+    /// let skinning = walk.skinning_matrices(&skin.skeleton);
+    /// ```
+    ///
+    /// The operation is allocation-free — results are written in place.
+    pub fn blend(&mut self, other: &Pose, weight: f32) {
+        let n = self.joints.len().min(other.joints.len());
+        for i in 0..n {
+            let rhs = other.joints[i];
+            self.joints[i].blend(&rhs, weight);
+        }
+    }
+
+    /// Blend `self` with N other poses in a single pass, using
+    /// `(weight, pose)` pairs. Weights are normalised so their sum
+    /// equals 1.0 — callers can pass un-normalised weights (say,
+    /// stick-axis magnitudes from a blend tree) and get a sensible
+    /// result without having to renormalise upstream.
+    ///
+    /// Mathematically: at each joint this accumulates
+    /// `Σ (w_i / Σw) * pose_i.joint`, where `pose_0 = self` gets an
+    /// implicit weight of `1.0 - Σ weights` so single-source blend
+    /// reduces to [`Pose::blend`]. If all weights are zero (or the
+    /// slice is empty) this is a no-op.
+    ///
+    /// Shape mismatch between poses is handled the same way as
+    /// [`Pose::blend`]: out-of-range joints on either side are left
+    /// untouched.
+    pub fn blend_many(&mut self, others: &[(f32, &Pose)]) {
+        if others.is_empty() {
+            return;
+        }
+        let total: f32 = others.iter().map(|(w, _)| *w).sum();
+        if total <= f32::EPSILON {
+            return;
+        }
+        // Iterate with a running accumulator: after k sources have
+        // been folded in, the accumulated pose carries weight
+        // `weight_seen / total_seen` of each source. The next source
+        // adds itself at fraction `w / (weight_seen + w)` so the
+        // running pose stays a convex combination of the first k+1.
+        let mut weight_seen = 0.0f32;
+        for (w, pose) in others {
+            let w = *w;
+            if w <= 0.0 {
+                continue;
+            }
+            let next_total = weight_seen + w;
+            let frac = w / next_total;
+            self.blend(pose, frac);
+            weight_seen = next_total;
         }
     }
 
@@ -578,5 +667,149 @@ mod tests {
             0.0, 0.0, 1.0, 0.0, //
             0.0, 0.0, 0.0, 1.0, //
         ]
+    }
+
+    // ── Blend tests ──────────────────────────────────────────────────────
+
+    fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
+        (a - b).abs() < eps
+    }
+
+    /// Quaternion for a rotation of `angle_rad` around the +Y axis.
+    fn quat_y(angle_rad: f32) -> [f32; 4] {
+        let h = 0.5 * angle_rad;
+        [0.0, h.sin(), 0.0, h.cos()]
+    }
+
+    fn single_bone_skel() -> Skeleton {
+        Skeleton {
+            bones: vec![Bone {
+                name: "b".into(),
+                parent: None,
+                inverse_bind_matrix: identity16(),
+            }],
+        }
+    }
+
+    #[test]
+    fn joint_blend_zero_weight_is_identity_op() {
+        let mut base = JointTransform {
+            translation: [1.0, 2.0, 3.0],
+            rotation: quat_y(0.0),
+            scale: [2.0, 2.0, 2.0],
+        };
+        let other = JointTransform {
+            translation: [5.0, 5.0, 5.0],
+            rotation: quat_y(std::f32::consts::PI),
+            scale: [1.0, 1.0, 1.0],
+        };
+        base.blend(&other, 0.0);
+        assert!(approx_eq(base.translation[0], 1.0, 1e-5));
+        assert!(approx_eq(base.scale[0], 2.0, 1e-5));
+    }
+
+    #[test]
+    fn joint_blend_full_weight_replaces_self() {
+        let mut base = JointTransform::IDENTITY;
+        let other = JointTransform {
+            translation: [4.0, 0.0, 0.0],
+            rotation: quat_y(std::f32::consts::FRAC_PI_2),
+            scale: [3.0, 3.0, 3.0],
+        };
+        base.blend(&other, 1.0);
+        assert!(approx_eq(base.translation[0], 4.0, 1e-4));
+        assert!(approx_eq(base.scale[0], 3.0, 1e-4));
+        // rotation should be ~90° around Y — quaternion w component
+        // cos(45°) ≈ 0.7071.
+        assert!(approx_eq(base.rotation[3], std::f32::consts::FRAC_1_SQRT_2, 1e-4));
+    }
+
+    #[test]
+    fn joint_blend_halfway_translation_is_midpoint() {
+        let mut base = JointTransform {
+            translation: [0.0, 0.0, 0.0],
+            rotation: quat_y(0.0),
+            scale: [1.0, 1.0, 1.0],
+        };
+        let other = JointTransform {
+            translation: [10.0, 0.0, 0.0],
+            rotation: quat_y(std::f32::consts::PI),
+            scale: [1.0, 1.0, 1.0],
+        };
+        base.blend(&other, 0.5);
+        assert!(approx_eq(base.translation[0], 5.0, 1e-4));
+        // 50% slerp between identity and 180°-around-Y = 90°-around-Y.
+        // The w component of a 90° rotation is cos(45°) = 1/sqrt(2).
+        assert!(approx_eq(base.rotation[3], std::f32::consts::FRAC_1_SQRT_2, 1e-4));
+    }
+
+    #[test]
+    fn pose_blend_writes_each_joint_independently() {
+        let skel = Skeleton {
+            bones: vec![
+                Bone {
+                    name: "a".into(),
+                    parent: None,
+                    inverse_bind_matrix: identity16(),
+                },
+                Bone {
+                    name: "b".into(),
+                    parent: Some(0),
+                    inverse_bind_matrix: identity16(),
+                },
+            ],
+        };
+        let mut a = Pose::rest(&skel);
+        a.joints[0].translation = [0.0, 0.0, 0.0];
+        a.joints[1].translation = [0.0, 10.0, 0.0];
+        let mut b = Pose::rest(&skel);
+        b.joints[0].translation = [2.0, 0.0, 0.0];
+        b.joints[1].translation = [0.0, 20.0, 0.0];
+
+        a.blend(&b, 0.25);
+        assert!(approx_eq(a.joints[0].translation[0], 0.5, 1e-5)); // 0 * 0.75 + 2 * 0.25
+        assert!(approx_eq(a.joints[1].translation[1], 12.5, 1e-5)); // 10 * 0.75 + 20 * 0.25
+    }
+
+    #[test]
+    fn pose_blend_shorter_other_leaves_extra_joints_untouched() {
+        let skel = single_bone_skel();
+        let mut a = Pose::rest(&skel);
+        a.joints[0].translation = [7.0, 0.0, 0.0];
+        // Synthetic: build a zero-joint Pose and blend — self shouldn't move.
+        let b = Pose { joints: vec![] };
+        a.blend(&b, 1.0);
+        assert!(approx_eq(a.joints[0].translation[0], 7.0, 1e-5));
+    }
+
+    #[test]
+    fn pose_blend_many_normalises_weights() {
+        let skel = single_bone_skel();
+        let mut base = Pose::rest(&skel); // translation = [0, 0, 0]
+        let mut p1 = Pose::rest(&skel);
+        p1.joints[0].translation = [10.0, 0.0, 0.0];
+        let mut p2 = Pose::rest(&skel);
+        p2.joints[0].translation = [0.0, 20.0, 0.0];
+
+        // Pass un-normalised weights (3 + 1 = 4). Expected mix at the
+        // joint: (3/4) * p1 + (1/4) * p2 layered onto the base's
+        // existing translation. The running-accumulator algorithm
+        // produces the same end state as manually computing that sum.
+        base.blend_many(&[(3.0, &p1), (1.0, &p2)]);
+        assert!(approx_eq(base.joints[0].translation[0], 7.5, 1e-4));
+        assert!(approx_eq(base.joints[0].translation[1], 5.0, 1e-4));
+    }
+
+    #[test]
+    fn pose_blend_many_empty_and_zero_weight_are_noop() {
+        let skel = single_bone_skel();
+        let mut a = Pose::rest(&skel);
+        a.joints[0].translation = [1.0, 2.0, 3.0];
+        a.blend_many(&[]);
+        assert!(approx_eq(a.joints[0].translation[0], 1.0, 1e-5));
+
+        let other = Pose::rest(&skel);
+        a.blend_many(&[(0.0, &other)]);
+        assert!(approx_eq(a.joints[0].translation[0], 1.0, 1e-5));
     }
 }
