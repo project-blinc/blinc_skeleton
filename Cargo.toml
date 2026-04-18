@@ -16,5 +16,5 @@ categories = ["graphics", "game-development"]
 # Pinned `git` deps. Local-dev override is via `[patch]` in the
 # consuming workspace's Cargo.toml — see `blinc_gltf/Cargo.toml` for
 # the example snippet. Bump in lockstep with the upstream commits.
-blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "d6ec98040e74efca3f9be207bef00bb5164a1d7a" }
-blinc_gltf = { git = "https://github.com/project-blinc/blinc_gltf.git", rev = "7549b1c25ffbcb8937a5a64e32576ebf46179305" }
+blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "3c449d4a22a5b04359e7b330d9e4963c4570f51d" }
+blinc_gltf = { git = "https://github.com/project-blinc/blinc_gltf.git", rev = "61d19f837065db626e7bd70a93e35700caf9c5e8" }
