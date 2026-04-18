@@ -36,13 +36,17 @@ pipeline.
   field) and `blinc_gltf` (parse primitive morph targets into those
   fields) shipped together.
 
-- [ ] **Morph-target GPU rendering (Phase 2).** Mesh shader samples
-  `MeshData::morph_targets` per vertex and computes
-  `final = base + Σ weights[t]·delta[t]`. Needs blinc_gpu uniform +
-  per-vertex sampling of a morph-delta storage buffer (or a
-  data-texture path for the WebGL2 fallback). Not started —
-  visually-verifiable via Khronos's `AnimatedMorphCube` sample once
-  the shader lands.
+- [x] **Morph-target GPU rendering.** Mesh shader's vertex stage
+  samples `morph_deltas` (storage buffer binding 14) and
+  `morph_weights` (binding 15) and computes
+  `final = base + Σ weights[t] · delta[t]` via a `for` loop gated
+  on `morph_target_count`. Weights are written per-draw from the
+  `Pose::morph_weights_for_node` side-table; deltas are cached
+  per-mesh by the inner `Arc<Vec<MorphTarget>>` pointer so the
+  upload runs once per asset, not once per frame.
+  Cutegirl_morph_demo (152 targets per face) and strangler_demo
+  (13 morph-weights channels) both animate facial expressions
+  through this path.
 
 ---
 
