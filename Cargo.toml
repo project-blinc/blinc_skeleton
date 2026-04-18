@@ -17,4 +17,4 @@ categories = ["graphics", "game-development"]
 # consuming workspace's Cargo.toml — see `blinc_gltf/Cargo.toml` for
 # the example snippet. Bump in lockstep with the upstream commits.
 blinc_core = { git = "https://github.com/project-blinc/Blinc.git", rev = "d6ec98040e74efca3f9be207bef00bb5164a1d7a" }
-blinc_gltf = { git = "https://github.com/project-blinc/blinc_gltf.git", rev = "a98b8fa63dd7d197db4729358517b4c65da104d9" }
+blinc_gltf = { git = "https://github.com/project-blinc/blinc_gltf.git", rev = "e4fd2adef1b7474613d07a304d1d2ede50aaa3e5" }
